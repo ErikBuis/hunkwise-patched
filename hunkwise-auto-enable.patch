@@ -1,0 +1,1828 @@
+diff --git a/README.md b/README.md
+index dc122e2..db5e22d 100644
+--- a/README.md
++++ b/README.md
+@@ -18,11 +18,11 @@ AI coding tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-cod
+ 
+ ## Features
+ 
+-- Tracks file changes from any source (AI tools, scripts, manual edits)
++- Tracks exactly the file changes made by Claude Code's file tools (Edit, Write, NotebookEdit); nothing else produces hunks
+ - Per-hunk `✓ Accept | ↺ Discard` controls inline in the editor
+ - Added lines highlighted in green, removed lines highlighted in red
+ - Sidebar panel lists all pending files with hunk details and batch actions
+-- New files and deleted files are tracked and displayed
++- New files created by Claude are tracked and displayed
+ - State persisted across VSCode restarts via a lightweight internal git repo
+ - Respects `.gitignore` and custom ignore patterns
+ 
+@@ -42,7 +42,7 @@ Click **Enable** in the hunkwise sidebar panel. hunkwise will snapshot all curre
+ 
+ ### Automatic tracking
+ 
+-Once enabled, any external tool (AI assistant, script, etc.) that writes to a file will automatically trigger review mode for that file.
++Once enabled, every file that Claude Code changes with its Edit, Write or NotebookEdit tool automatically enters review mode. This works through Claude Code hooks that hunkwise receives on `http://127.0.0.1:47821/hunkwise/claude-hook`; `install.ps1` registers them in `~/.claude/settings.json`. Files Claude changes through Bash (e.g. `sed`, scripts, git) are not tracked, because they cannot be attributed to Claude without false positives.
+ 
+ ### Reviewing changes
+ 
+@@ -53,7 +53,6 @@ Once enabled, any external tool (AI assistant, script, etc.) that writes to a fi
+   - Accept or discard all changes in a file
+   - Accept or discard all changes across all files
+ - Click a file name in the panel to open it
+-- Deleted files show a diff view with the original content
+ 
+ ### Disable hunkwise
+ 
+@@ -95,18 +94,16 @@ When an external tool modifies a file, hunkwise diffs the current content agains
+ 
+ ### External vs manual change detection
+ 
+-hunkwise distinguishes between:
++hunkwise only shows changes it knows Claude Code made. When an Edit/Write/NotebookEdit call starts, Claude Code's `PreToolUse` hook lets hunkwise record the file's content. When it ends, `PostToolUse` (or `PostToolUseFailure`) gives the result. The difference between the two becomes the hunks.
+ 
+-- **External changes** (AI tools, scripts): Detected when the file content on disk differs from the open editor buffer. These trigger review mode with inline hunks.
+-- **Manual edits** (user typing in VSCode): The editor buffer matches the disk content after save. These silently update the baseline — no hunks shown.
++Every other change (typing, saving, Source Control discards, stash or checkout, formatters, other tools) silently updates the baseline. If such a change touches a file that still has Claude hunks, only the Claude hunks it overlaps are dropped (you dealt with them); the rest stay, and your change itself never shows up as a hunk.
+ 
+-This means you can freely edit files while hunkwise is enabled, and only tool-generated changes will produce hunks.
++Only one VSCode window can listen on the port. It writes each hook event to a shared folder in the temp directory, which every window follows, and another window takes over when it closes. Changes Claude makes while no VSCode window is open are not tracked.
+ 
+ ### File rename and delete handling
+ 
+ - **Manual rename** (via VSCode explorer/API): hunkwise migrates the baseline to the new path. No spurious deletion hunk is shown.
+-- **Manual delete** (via VSCode explorer/API): hunkwise removes the baseline. No deletion hunk is shown.
+-- **External delete** (tool deletes a file): Shows a deletion hunk so you can review and restore if needed.
++- **Delete**: hunkwise removes the baseline and any hunks. Claude Code has no delete tool, so deletions never produce hunks.
+ 
+ ### Ignore rules
+ 
+diff --git a/src/claudeHooks.ts b/src/claudeHooks.ts
+new file mode 100644
+index 0000000..a11c6a4
+--- /dev/null
++++ b/src/claudeHooks.ts
+@@ -0,0 +1,299 @@
++import * as fs from 'fs';
++import * as http from 'http';
++import * as os from 'os';
++import * as path from 'path';
++import { log } from './log';
++
++// Claude Code sends its hook events here (see install.ps1, which registers these hooks).
++export const HOOK_PORT = 47821;
++export const HOOK_PATH = '/hunkwise/claude-hook';
++
++// Claude Code tools that change a file named in their input. Bash is deliberately not tracked:
++// it cannot be attributed to specific files without false positives.
++const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
++
++const MAX_BODY_BYTES = 64 * 1024 * 1024;
++const MAX_FILE_BYTES = 20 * 1024 * 1024;
++const LEADER_RETRY_MS = 3000;
++const EVENT_TTL_MS = 15 * 60 * 1000;
++const PRUNE_INTERVAL_MS = 60 * 1000;
++const POLL_MS = 1000;
++// A tool call whose end we never hear about (e.g. its permission prompt was rejected) is
++// forgotten after this long.
++const WINDOW_TTL_MS = 10 * 60 * 1000;
++
++/** Directory through which the VSCode window that receives the hooks shares them with all windows. */
++export function claudeEventsDir(): string {
++  return path.join(os.tmpdir(), 'hunkwise-claude-events');
++}
++
++/** Key for comparing paths (Windows paths are case-insensitive, and drive letter case varies). */
++export function pathKey(p: string): string {
++  const resolved = path.resolve(p);
++  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
++}
++
++/** Read a text file: null when it does not exist, undefined when it cannot be read or is too large. */
++export function readTextSync(filePath: string): string | null | undefined {
++  try {
++    if (fs.statSync(filePath).size > MAX_FILE_BYTES) return undefined;
++    return fs.readFileSync(filePath, 'utf-8');
++  } catch (err: any) {
++    return err?.code === 'ENOENT' ? null : undefined;
++  }
++}
++
++/**
++ * One Claude Code tool call on a file, as shared between VSCode windows. before/after are the
++ * file contents right before and after the call (null: no file, absent: unknown).
++ */
++export interface ClaudeToolEvent {
++  kind: 'pre' | 'post' | 'abandon';
++  id: string;
++  filePath: string;
++  before?: string | null;
++  after?: string | null;
++}
++
++/**
++ * Receives Claude Code's HTTP hooks. Only one VSCode window can listen on the port; it records
++ * every event as a file in claudeEventsDir() for all windows (itself included) to pick up. The
++ * other windows keep retrying, so one of them takes over when the listening window closes.
++ */
++export class ClaudeHookServer {
++  private server: http.Server | undefined;
++  private retryTimer: NodeJS.Timeout | undefined;
++  private counter = 0;
++  private lastPrune = 0;
++  private disposed = false;
++  // Content captured by PreToolUse, repeated in the PostToolUse event for windows that missed it.
++  private beforeById = new Map<string, { before: string | null | undefined; time: number }>();
++
++  constructor(private readonly port = HOOK_PORT, private readonly dir = claudeEventsDir()) {}
++
++  get listening(): boolean {
++    return this.server?.listening ?? false;
++  }
++
++  start(): void {
++    if (this.disposed) return;
++    const server = http.createServer((req, res) => this.handle(req, res));
++    const onStartError = (err: NodeJS.ErrnoException) => {
++      server.close();
++      if (err.code !== 'EADDRINUSE') log(`claude hooks: cannot listen on port ${this.port}: ${err.message}`);
++      if (!this.disposed) this.retryTimer = setTimeout(() => this.start(), LEADER_RETRY_MS);
++    };
++    server.once('error', onStartError);
++    server.listen(this.port, '127.0.0.1', () => {
++      server.off('error', onStartError);
++      server.on('error', err => log(`claude hooks: server error: ${err.message}`));
++      if (this.disposed) { server.close(); return; }
++      this.server = server;
++      log(`claude hooks: receiving Claude Code hooks on 127.0.0.1:${this.port}`);
++    });
++  }
++
++  private handle(req: http.IncomingMessage, res: http.ServerResponse): void {
++    // Claude Code always sends JSON to 127.0.0.1. Rejecting anything else keeps web pages
++    // (which cannot send JSON cross-origin without a preflight) and DNS rebinding out.
++    const host = req.headers.host ?? '';
++    const contentType = req.headers['content-type'] ?? '';
++    if (req.method !== 'POST' || req.url !== HOOK_PATH) {
++      res.writeHead(404).end();
++      return;
++    }
++    if ((host !== `127.0.0.1:${this.port}` && host !== `localhost:${this.port}`) || !contentType.startsWith('application/json')) {
++      res.writeHead(403).end();
++      return;
++    }
++    const chunks: Buffer[] = [];
++    let size = 0;
++    req.on('data', (chunk: Buffer) => {
++      size += chunk.length;
++      if (size > MAX_BODY_BYTES) {
++        res.writeHead(413).end();
++        req.destroy();
++        return;
++      }
++      chunks.push(chunk);
++    });
++    req.on('end', () => {
++      if (size > MAX_BODY_BYTES) return;
++      try {
++        this.process(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
++      } catch (err) {
++        log(`claude hooks: bad hook request: ${err}`);
++      }
++      // Empty 200: no decision, Claude Code carries on as if there was no hook.
++      res.writeHead(200).end();
++    });
++  }
++
++  /** Turn one hook input into a shared event. Runs to completion before Claude Code gets the response. */
++  process(input: any): void {
++    const tool = input?.tool_name;
++    if (!FILE_TOOLS.has(tool)) return;
++    const rawPath = input.tool_input?.file_path ?? input.tool_input?.notebook_path;
++    if (typeof rawPath !== 'string' || rawPath === '') return;
++    const filePath = path.resolve(typeof input.cwd === 'string' ? input.cwd : '', rawPath);
++    const id = typeof input.tool_use_id === 'string' ? input.tool_use_id : `${input.session_id}:${filePath}`;
++
++    switch (input.hook_event_name) {
++      case 'PreToolUse': {
++        const before = readTextSync(filePath);
++        this.beforeById.set(id, { before, time: Date.now() });
++        this.writeEvent({ kind: 'pre', id, filePath, before });
++        break;
++      }
++      case 'PostToolUse':
++      case 'PostToolUseFailure': {
++        const pre = this.beforeById.get(id);
++        this.beforeById.delete(id);
++        const after = readTextSync(filePath);
++        this.writeEvent({ kind: 'post', id, filePath, before: pre?.before, after });
++        break;
++      }
++      case 'PermissionDenied':
++        this.beforeById.delete(id);
++        this.writeEvent({ kind: 'abandon', id, filePath });
++        break;
++    }
++  }
++
++  private writeEvent(event: ClaudeToolEvent): void {
++    fs.mkdirSync(this.dir, { recursive: true });
++    const name = `${String(Date.now()).padStart(15, '0')}-${process.pid}-${String(++this.counter).padStart(6, '0')}.json`;
++    const target = path.join(this.dir, name);
++    // Write then rename, so other windows never read a half-written event.
++    fs.writeFileSync(target + '.tmp', JSON.stringify(event), 'utf-8');
++    fs.renameSync(target + '.tmp', target);
++    this.prune();
++  }
++
++  private prune(): void {
++    const now = Date.now();
++    if (now - this.lastPrune < PRUNE_INTERVAL_MS) return;
++    this.lastPrune = now;
++    for (const [id, entry] of this.beforeById) {
++      if (now - entry.time > EVENT_TTL_MS) this.beforeById.delete(id);
++    }
++    let names: string[];
++    try { names = fs.readdirSync(this.dir); } catch { return; }
++    for (const name of names) {
++      const time = Number(name.slice(0, 15));
++      if (Number.isFinite(time) && now - time > EVENT_TTL_MS) {
++        try { fs.unlinkSync(path.join(this.dir, name)); } catch { /* another window pruned it */ }
++      }
++    }
++  }
++
++  dispose(): void {
++    this.disposed = true;
++    if (this.retryTimer) clearTimeout(this.retryTimer);
++    this.server?.close();
++    this.server = undefined;
++  }
++}
++
++export interface ClaudeToolTrackerHandlers {
++  /** A Claude tool call on filePath is about to change it. */
++  onToolStarted(event: { id: string; filePath: string }): void;
++  /** A Claude tool call on filePath finished (successfully or not). */
++  onToolDone(event: { id: string; filePath: string; before: string | null | undefined; after: string | null | undefined }): void;
++  /** A Claude tool call on filePath will not happen after all, or never reported back. */
++  onAbandoned(event: { id: string; filePath: string }): void;
++}
++
++/** Follows the shared events and knows which files a Claude tool call is currently working on. */
++export class ClaudeToolTracker {
++  private seen = new Set<string>();
++  private open = new Map<string, { filePath: string; key: string; before: string | null | undefined; openedAt: number }>();
++  private watcher: fs.FSWatcher | undefined;
++  private timer: NodeJS.Timeout | undefined;
++  private catchingUp = false;
++
++  constructor(private readonly dir: string, private readonly handlers: ClaudeToolTrackerHandlers) {}
++
++  start(): void {
++    fs.mkdirSync(this.dir, { recursive: true });
++    // Events from before this window started are history, not ours to replay.
++    for (const name of fs.readdirSync(this.dir)) this.seen.add(name);
++    try {
++      this.watcher = fs.watch(this.dir, { persistent: false }, () => this.catchUp());
++    } catch (err) {
++      log(`claude hooks: cannot watch ${this.dir}, polling only: ${err}`);
++    }
++    this.timer = setInterval(() => { this.catchUp(); this.expire(); }, POLL_MS);
++  }
++
++  /**
++   * Whether a Claude tool call on filePath has started but not finished. Reads new events first:
++   * the PreToolUse event is on disk before the tool runs, so it is always seen before the change.
++   */
++  isWorkingOn(filePath: string): boolean {
++    this.catchUp();
++    this.expire();
++    const key = pathKey(filePath);
++    for (const w of this.open.values()) {
++      if (w.key === key) return true;
++    }
++    return false;
++  }
++
++  catchUp(): void {
++    if (this.catchingUp) return;
++    this.catchingUp = true;
++    try {
++      let names: string[];
++      try { names = fs.readdirSync(this.dir); } catch { return; }
++      const present = new Set(names);
++      for (const name of this.seen) {
++        if (!present.has(name)) this.seen.delete(name);
++      }
++      for (const name of names.filter(n => n.endsWith('.json') && !this.seen.has(n)).sort()) {
++        this.seen.add(name);
++        let event: ClaudeToolEvent;
++        try {
++          event = JSON.parse(fs.readFileSync(path.join(this.dir, name), 'utf-8'));
++        } catch {
++          continue;
++        }
++        this.apply(event);
++      }
++    } finally {
++      this.catchingUp = false;
++    }
++  }
++
++  private apply(event: ClaudeToolEvent): void {
++    if (typeof event?.filePath !== 'string' || typeof event.id !== 'string') return;
++    const { id, filePath } = event;
++    if (event.kind === 'pre') {
++      this.open.set(id, { filePath, key: pathKey(filePath), before: event.before, openedAt: Date.now() });
++      this.handlers.onToolStarted({ id, filePath });
++    } else if (event.kind === 'post') {
++      const window = this.open.get(id);
++      this.open.delete(id);
++      const before = window?.before !== undefined ? window.before : event.before;
++      this.handlers.onToolDone({ id, filePath, before, after: event.after });
++    } else if (event.kind === 'abandon') {
++      if (this.open.delete(id)) this.handlers.onAbandoned({ id, filePath });
++    }
++  }
++
++  private expire(): void {
++    const now = Date.now();
++    for (const [id, w] of this.open) {
++      if (now - w.openedAt > WINDOW_TTL_MS) {
++        this.open.delete(id);
++        log(`claude hooks: gave up waiting for Claude to finish with ${path.basename(w.filePath)}`);
++        this.handlers.onAbandoned({ id, filePath: w.filePath });
++      }
++    }
++  }
++
++  dispose(): void {
++    this.watcher?.close();
++    if (this.timer) clearInterval(this.timer);
++  }
++}
+diff --git a/src/commands.ts b/src/commands.ts
+index 0a92f8b..da11991 100644
+--- a/src/commands.ts
++++ b/src/commands.ts
+@@ -8,6 +8,9 @@ import { computeHunks, hunkId } from './diffEngine';
+ import { upsertGitignore } from './gitignoreManager';
+ import { log } from './log';
+ 
++/** workspaceState key: set when the user explicitly disabled hunkwise in this workspace. */
++export const AUTO_ENABLE_OPT_OUT_KEY = 'hunkwise.autoEnableOptOut';
++
+ export function registerCommands(
+   context: vscode.ExtensionContext,
+   stateManager: StateManager,
+@@ -16,12 +19,15 @@ export function registerCommands(
+   onStateChanged: () => void
+ ): void {
+   context.subscriptions.push(
+-    vscode.commands.registerCommand('hunkwise.enable', () =>
+-      enableHunkwise(stateManager, fileWatcher, reviewPanel, onStateChanged)
+-    ),
+-    vscode.commands.registerCommand('hunkwise.disable', () =>
+-      disableHunkwise(stateManager, onStateChanged)
+-    ),
++    vscode.commands.registerCommand('hunkwise.enable', async () => {
++      await context.workspaceState.update(AUTO_ENABLE_OPT_OUT_KEY, false);
++      await enableHunkwise(stateManager, fileWatcher, reviewPanel, onStateChanged);
++    }),
++    vscode.commands.registerCommand('hunkwise.disable', async () => {
++      // Remember the explicit disable so auto-enable doesn't turn it back on.
++      await context.workspaceState.update(AUTO_ENABLE_OPT_OUT_KEY, true);
++      await disableHunkwise(stateManager, onStateChanged);
++    }),
+     vscode.commands.registerCommand('hunkwise.setIgnorePatterns', async (patterns: string[]) => {
+       stateManager.setIgnorePatterns(patterns);
+       onStateChanged();
+@@ -59,7 +65,9 @@ async function enableHunkwise(
+       new Promise(resolve => setTimeout(resolve, 750)),
+       (async () => {
+         await stateManager.setEnabled(true);
+-        try { upsertGitignore(); } catch (err) { log(`upsertGitignore failed: ${err}`); }
++        if (stateManager.dirInWorkspace) {
++          try { upsertGitignore(); } catch (err) { log(`upsertGitignore failed: ${err}`); }
++        }
+         await stateManager.snapshotWorkspace((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
+       })(),
+     ]);
+diff --git a/src/decorationManager.ts b/src/decorationManager.ts
+index e652a63..2f77b51 100644
+--- a/src/decorationManager.ts
++++ b/src/decorationManager.ts
+@@ -94,9 +94,15 @@ interface HunkInset {
+   disposeListener: vscode.Disposable;
+   // Cache key: used to detect whether this inset can be reused
+   cacheKey: string;
++  // Assigning webview.html reloads the webview, so only do it when the content changed.
++  html: string;
+   disposed: boolean;
+ }
+ 
++// While typing, insets (webviews, expensive to rebuild) are refreshed only after this pause.
++// VSCode keeps existing insets attached to their lines meanwhile.
++const TYPING_INSET_DELAY_MS = 300;
++
+ function insetCacheKey(afterLine: number, height: number): string {
+   return `${afterLine}:${height}`;
+ }
+@@ -104,6 +110,7 @@ function insetCacheKey(afterLine: number, height: number): string {
+ export class DecorationManager {
+   // editorKey → ordered list of insets for that editor
+   private insets: Map<string, HunkInset[]> = new Map();
++  private insetTimers: Map<string, NodeJS.Timeout> = new Map();
+   private onAction: ((command: 'accept' | 'discard', filePath: string, hunkId: string) => void) | undefined;
+ 
+   constructor(
+@@ -121,6 +128,35 @@ export class DecorationManager {
+     }
+   }
+ 
++  /**
++   * Refresh after typing: update the added-line highlights right away (cheap), and the insets
++   * once typing pauses, so every keystroke doesn't rebuild webviews.
++   */
++  refreshWhileTyping(editor: vscode.TextEditor): void {
++    const editorKey = editor.document.uri.toString();
++    const fileState = this.stateManager.getFile(editor.document.uri.fsPath);
++    if (!fileState || fileState.status !== 'reviewing') {
++      this.refresh([editor]);
++      return;
++    }
++    const ranges: vscode.Range[] = [];
++    for (const hunk of computeHunks(fileState.baseline, editor.document.getText())) {
++      for (let i = 0; i < hunk.newLines; i++) {
++        const lineIdx = hunk.newStart - 1 + i;
++        if (lineIdx < editor.document.lineCount) ranges.push(editor.document.lineAt(lineIdx).range);
++      }
++    }
++    editor.setDecorations(addedLineDecoration, ranges);
++
++    const existing = this.insetTimers.get(editorKey);
++    if (existing) clearTimeout(existing);
++    this.insetTimers.set(editorKey, setTimeout(() => {
++      this.insetTimers.delete(editorKey);
++      const target = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === editorKey);
++      if (target) this.applyToEditor(target, this.diffEditorFilePaths());
++    }, TYPING_INSET_DELAY_MS));
++  }
++
+   refreshActionBar(_editor: vscode.TextEditor): void { /* buttons live in insets */ }
+ 
+   private disposeInsetList(list: HunkInset[]): void {
+@@ -150,6 +186,11 @@ export class DecorationManager {
+     const filePath = editor.document.uri.fsPath;
+     const editorKey = editor.document.uri.toString();
+     const fileState = this.stateManager.getFile(filePath);
++    const pendingTimer = this.insetTimers.get(editorKey);
++    if (pendingTimer) {
++      clearTimeout(pendingTimer);
++      this.insetTimers.delete(editorKey);
++    }
+ 
+     // Skip insets: in diff editors (viewColumn undefined), or when user disabled inline decorations
+     const isInDiff = editor.viewColumn === undefined && diffPaths.has(filePath);
+@@ -253,8 +294,11 @@ export class DecorationManager {
+       const key = insetCacheKey(spec.afterLine, spec.height);
+       const prev = existing[i];
+       if (prev && prev.cacheKey === key && !prev.disposed) {
+-        // Same position/height and still alive — reuse, just update html
+-        prev.inset.webview.html = spec.html;
++        // Same position/height and still alive — reuse, update html only if it changed
++        if (prev.html !== spec.html) {
++          prev.inset.webview.html = spec.html;
++          prev.html = spec.html;
++        }
+         nextInsets.push(prev);
+         existing[i] = undefined as any; // mark as consumed
+       } else {
+@@ -300,7 +344,7 @@ export class DecorationManager {
+         }
+       });
+       const entry: HunkInset = {
+-        inset, disposable, cacheKey, disposed: false,
++        inset, disposable, cacheKey, html, disposed: false,
+         disposeListener: inset.onDidDispose(() => {
+           entry.disposed = true;
+           // Re-apply if editor is still visible so insets are immediately rebuilt
+@@ -318,6 +362,8 @@ export class DecorationManager {
+   }
+ 
+   dispose(): void {
++    for (const timer of this.insetTimers.values()) clearTimeout(timer);
++    this.insetTimers.clear();
+     addedLineDecoration.dispose();
+     for (const list of this.insets.values()) {
+       this.disposeInsetList(list);
+diff --git a/src/diffEngine.ts b/src/diffEngine.ts
+index 96e6c36..e538a67 100644
+--- a/src/diffEngine.ts
++++ b/src/diffEngine.ts
+@@ -73,3 +73,80 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
+   return hunks;
+ }
+ 
++// ── Baseline rebasing ───────────────────────────────────────────────────────
++
++/** Split text into line tokens that keep their line ending, the same way Diff.diffLines() does. */
++function lineTokens(text: string): string[] {
++  return text.split(/(?<=\n)/).filter(t => t !== '');
++}
++
++/** A changed region as 0-based, end-exclusive line token ranges in the old and new text. */
++interface TokenHunk { oldStart: number; oldEnd: number; newStart: number; newEnd: number }
++
++function tokenHunks(oldText: string, newText: string): TokenHunk[] {
++  const hunks: TokenHunk[] = [];
++  let oldPos = 0;
++  let newPos = 0;
++  let current: TokenHunk | undefined;
++  for (const change of Diff.diffLines(oldText, newText)) {
++    const n = lineTokens(change.value).length;
++    if (!change.added && !change.removed) {
++      oldPos += n;
++      newPos += n;
++      current = undefined;
++      continue;
++    }
++    if (!current) {
++      current = { oldStart: oldPos, oldEnd: oldPos, newStart: newPos, newEnd: newPos };
++      hunks.push(current);
++    }
++    if (change.removed) {
++      oldPos += n;
++      current.oldEnd = oldPos;
++    } else {
++      newPos += n;
++      current.newEnd = newPos;
++    }
++  }
++  return hunks;
++}
++
++/**
++ * Whether two line ranges touch. Non-empty ranges must share a line; an empty range (an
++ * insertion or deletion point) must lie strictly inside the other range, or two points must coincide.
++ */
++function rangesTouch(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
++  const aEmpty = aStart === aEnd;
++  const bEmpty = bStart === bEnd;
++  if (aEmpty && bEmpty) return aStart === bStart;
++  if (aEmpty) return bStart < aStart && aStart < bEnd;
++  if (bEmpty) return aStart < bStart && bStart < aEnd;
++  return aStart < bEnd && bStart < aEnd;
++}
++
++/**
++ * Fold a change that was not made by the AI tool into the review baseline, so that only the
++ * tool's own changes remain as hunks.
++ *
++ * The file went from before to after. The hunks between baseline and before are the tool's
++ * pending changes. Pending hunks that the change touches count as handled and are dropped; the
++ * others are kept. The result is after with every kept hunk reverted to its baseline lines, so
++ * that computeHunks(result, after) yields exactly the kept hunks. A null baseline means the tool
++ * created the file.
++ */
++export function rebaseBaseline(baseline: string | null, before: string, after: string): string {
++  const baseTokens = lineTokens(baseline ?? '');
++  const pending = tokenHunks(baseline ?? '', before);
++  const changes = tokenHunks(before, after);
++  const result = lineTokens(after);
++
++  const kept = pending.filter(p => !changes.some(c => rangesTouch(p.newStart, p.newEnd, c.oldStart, c.oldEnd)));
++  // Revert from the end so earlier positions in result stay valid.
++  for (const p of kept.reverse()) {
++    const shift = changes
++      .filter(c => c.oldEnd <= p.newStart)
++      .reduce((sum, c) => sum + (c.newEnd - c.newStart) - (c.oldEnd - c.oldStart), 0);
++    result.splice(p.newStart + shift, p.newEnd - p.newStart, ...baseTokens.slice(p.oldStart, p.oldEnd));
++  }
++  return result.join('');
++}
+diff --git a/src/extension.ts b/src/extension.ts
+index d78cdf8..668cf3a 100644
+--- a/src/extension.ts
++++ b/src/extension.ts
+@@ -5,7 +5,7 @@ import { StateManager } from './stateManager';
+ import { FileWatcher } from './fileWatcher';
+ import { DecorationManager } from './decorationManager';
+ import { ReviewPanel } from './reviewPanel';
+-import { registerCommands, acceptHunk, discardHunk } from './commands';
++import { registerCommands, acceptHunk, discardHunk, AUTO_ENABLE_OPT_OUT_KEY } from './commands';
+ import { DiffCodeLensProvider } from './diffCodeLens';
+ import { initLog, log } from './log';
+ 
+@@ -13,7 +13,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+   initLog();
+   const ext = vscode.extensions.getExtension('molon.hunkwise');
+   log(`activate v${ext?.packageJSON?.version ?? '?'}`);
+-  const stateManager = new StateManager();
++  // Keep state in VSCode's per-workspace storage instead of <workspace>/.vscode/hunkwise.
++  const stateManager = new StateManager(context.storageUri?.fsPath);
+   stateManager.onRollback = () => onStateChanged();
+ 
+   // Content provider for showing baselines in diff view
+@@ -96,6 +97,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+   try {
+     await stateManager.load((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
+     log(`loaded state: enabled=${stateManager.enabled}, files=${stateManager.getAllFiles().size}`);
++    await fileWatcher.reconcileUnattributed();
+   } finally {
+     fileWatcher.resumeAll();
+   }
+@@ -119,11 +121,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+     }),
+     vscode.workspace.onDidChangeTextDocument(e => {
+       if (e.document.uri.scheme !== 'file') return;
++      if (e.contentChanges.length === 0) return;
+       const editor = vscode.window.visibleTextEditors.find(
+         ed => ed.document.uri.fsPath === e.document.uri.fsPath
+       );
+-      if (editor) decorationManager?.refresh([editor]);
+-      reviewPanel?.refresh();
++      if (editor) decorationManager?.refreshWhileTyping(editor);
++      reviewPanel?.refreshSoon();
+     }),
+   );
+ 
+@@ -156,6 +159,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+       reviewPanel?.setLoading(true);
+       try {
+         await stateManager.rebuildState((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
++        await fileWatcher.reconcileUnattributed();
+         onStateChanged();
+       } catch (err) {
+         log(`refresh: error — ${err}`);
+@@ -183,6 +187,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+       reviewPanel?.setLoading(false);
+       onStateChanged();
+     });
++  } else if (stateManager.dir && !context.workspaceState.get<boolean>(AUTO_ENABLE_OPT_OUT_KEY)) {
++    // Auto-enable in every workspace unless the user explicitly disabled it here.
++    log('auto-enable');
++    vscode.commands.executeCommand('hunkwise.enable').then(undefined, err => {
++      log(`auto-enable: error — ${err}`);
++      onStateChanged();
++    });
+   } else {
+     onStateChanged();
+   }
+diff --git a/src/fileWatcher.ts b/src/fileWatcher.ts
+index f1ef23e..e9d7921 100644
+--- a/src/fileWatcher.ts
++++ b/src/fileWatcher.ts
+@@ -5,9 +5,11 @@ import * as path from 'path';
+ const ignoreLib: ((options?: { ignoreCase?: boolean }) => import('ignore').Ignore) & typeof import('ignore') = require('ignore');
+ type Ignore = import('ignore').Ignore;
+ import { StateManager } from './stateManager';
+-import { computeHunks } from './diffEngine';
++import { FileState } from './types';
++import { computeHunks, rebaseBaseline } from './diffEngine';
+ import { log } from './log';
+ import { normalizePath } from './pathNormalize';
++import { ClaudeHookServer, ClaudeToolTracker, claudeEventsDir, pathKey, readTextSync } from './claudeHooks';
+ 
+ // Transform gitignore rules from a sub-directory so they work in a single
+ // root-level matcher. Adds the directory's relative path as prefix, handling
+@@ -39,11 +41,23 @@ function prefixGitignoreRules(content: string, prefix: string): string {
+ export class FileWatcher {
+   private disposables: vscode.Disposable[] = [];
+   private selfEditFiles: Set<string> = new Set();
+-  // Files being deleted by the user via VSCode (explorer / applyEdit)
+-  private pendingUserDeletes: Set<string> = new Set();
+   // Old paths of in-progress user renames — suppress onDiskDelete without extra git ops
+   private pendingRenameOldPaths: Set<string> = new Set();
+   private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
++  private hookServer: ClaudeHookServer | undefined;
++  private tracker: ClaudeToolTracker | undefined;
++  // Files under review: the content their hunks were last computed against. Needed to tell
++  // which part of a later change is not Claude's. Saved next to the baselines (knownPath).
++  private knownContent: Map<string, string> = new Map();
++  private knownLoaded = false;
++  private saveKnownTimer: NodeJS.Timeout | undefined;
++  // Files under review whose baseline was updated for unsaved edits but not yet saved to git.
++  private unpersisted: Set<string> = new Set();
++  // Review state of a file when a Claude tool call on it started, by tool call id. Changes seen
++  // while the call runs (its own write among them) are first handled as yours; when the call
++  // reports back, the file is reset to this state and the changes are replayed correctly.
++  private claudeSnapshots: Map<string, { filePath: string; state: FileState | undefined; known: string | undefined }> = new Map();
++  private changedDuringClaude: Set<string> = new Set();
+   private onStateChanged: () => void;
+   private onIgnoreRulesChanged: (() => void) | undefined;
+   // Compiled ignore instance from workspace .gitignore
+@@ -75,23 +89,7 @@ export class FileWatcher {
+     watcher.onDidCreate(uri => this.onDiskCreate(uri));
+     this.disposables.push(watcher);
+ 
+-    // onWillDeleteFiles fires for user-initiated deletes (explorer, applyEdit),
+-    // but NOT for external tool deletes — use this to distinguish the two.
+-    // onDidDeleteFiles may fire before FileSystemWatcher.onDidDelete, so we use
+-    // a short timeout as fallback cleanup instead of removing immediately.
+     this.disposables.push(
+-      vscode.workspace.onWillDeleteFiles(e => {
+-        for (const uri of e.files) {
+-          this.pendingUserDeletes.add(normalizePath(uri.fsPath));
+-        }
+-      }),
+-      vscode.workspace.onDidDeleteFiles(e => {
+-        setTimeout(() => {
+-          for (const uri of e.files) {
+-            this.pendingUserDeletes.delete(normalizePath(uri.fsPath));
+-          }
+-        }, 500);
+-      }),
+       // onWillRenameFiles fires BEFORE the actual rename. Record paths so
+       // the subsequent onDiskDelete/onDiskCreate events are suppressed, and
+       // migrate state+git. UI refresh is deferred to onDidRenameFiles because
+@@ -105,6 +103,13 @@ export class FileWatcher {
+           this.pendingRenameOldPaths.add(oldPath);
+           this.selfEditFiles.add(newPath);
+           this.stateManager.renameFile(oldPath, newPath);
++          for (const [filePath, content] of Array.from(this.knownContent)) {
++            if (filePath === oldPath || filePath.startsWith(oldPath + path.sep)) {
++              this.knownContent.delete(filePath);
++              this.knownContent.set(newPath + filePath.slice(oldPath.length), content);
++            }
++          }
++          this.scheduleSaveKnown();
+         }
+       }),
+       vscode.workspace.onDidRenameFiles(e => {
+@@ -125,6 +130,37 @@ export class FileWatcher {
+     });
+     this.disposables.push(docChange);
+ 
++    this.disposables.push(
++      vscode.workspace.onDidCloseTextDocument(doc => {
++        if (doc.uri.scheme !== 'file') return;
++        const filePath = normalizePath(doc.uri.fsPath);
++        // Closing without saving drops unsaved edits that were already folded into the baseline.
++        if (this.isTracked(filePath) && this.stateManager.getFile(filePath)?.status === 'reviewing') {
++          void this.onObservedChange(filePath);
++        }
++      }),
++      vscode.workspace.onDidSaveTextDocument(doc => {
++        if (doc.uri.scheme === 'file') this.persistBaseline(normalizePath(doc.uri.fsPath));
++      }),
++    );
++
++    // Every window runs the hook server; whichever gets the port receives Claude Code's hooks
++    // and shares them with all windows through the events dir.
++    this.hookServer = new ClaudeHookServer();
++    this.hookServer.start();
++    try {
++      this.tracker = new ClaudeToolTracker(claudeEventsDir(), {
++        onToolStarted: event => this.onClaudeToolStarted(event),
++        onToolDone: event => { void this.onClaudeToolDone(event); },
++        onAbandoned: event => { this.claudeSnapshots.delete(event.id); },
++      });
++      this.tracker.start();
++    } catch (err) {
++      log(`claude hooks: cannot follow Claude Code tool calls: ${err}`);
++      this.tracker = undefined;
++    }
++    this.disposables.push({ dispose: () => { this.hookServer?.dispose(); this.tracker?.dispose(); this.flushKnown(); } });
++
+     context.subscriptions.push(...this.disposables);
+   }
+ 
+@@ -208,7 +244,16 @@ export class FileWatcher {
+   }
+ 
+   clearSelfEdit(filePath: string): void {
+-    this.selfEditFiles.delete(normalizePath(filePath));
++    const normalized = normalizePath(filePath);
++    this.selfEditFiles.delete(normalized);
++    // hunkwise just rewrote the file itself (discard); its hunks now refer to the new content.
++    if (this.stateManager.getFile(normalized)?.status !== 'reviewing') return;
++    const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && normalizePath(d.uri.fsPath) === normalized);
++    const text = doc ? doc.getText() : readTextSync(normalized);
++    if (typeof text === 'string') {
++      this.knownContent.set(normalized, text);
++      this.scheduleSaveKnown();
++    }
+   }
+ 
+   shouldIgnore(filePath: string, isDirectory?: boolean): boolean {
+@@ -253,256 +298,303 @@ export class FileWatcher {
+     return false;
+   }
+ 
+-  private async onDiskCreate(uri: vscode.Uri): Promise<void> {
+-    const filePath = normalizePath(uri.fsPath);
+-    const basename = path.basename(filePath);
+-    if (this._suppressed) return;
+-    if (!this.stateManager.enabled) return;
+-    if (this.shouldIgnore(filePath)) return;
+-    if (this.selfEditFiles.has(filePath)) return;
+-
+-    const fileState = this.stateManager.getFile(filePath);
+-    log(`onDiskCreate(${basename}): fileState=${fileState ? `{status:${fileState.status}, baseline.len:${fileState.baseline?.length ?? 'null'}}` : 'undefined'}`);
+-    if (fileState?.status === 'reviewing') {
+-      // File was deleted (showing deletion hunk) but now re-created — recompute
+-      let diskContent: string;
+-      try {
+-        diskContent = await fs.promises.readFile(filePath, 'utf-8');
+-      } catch {
+-        log(`onDiskCreate(${basename}): read failed while reviewing, skip`);
+-        return;
+-      }
+-      log(`onDiskCreate(${basename}): reviewing, recompute hunks (baseline.len=${fileState.baseline?.length ?? 'null'}, disk.len=${diskContent.length})`);
+-      this.recomputeHunks(filePath, fileState.baseline, diskContent);
+-      return;
+-    }
+-    if (fileState) { log(`onDiskCreate(${basename}): has fileState but not reviewing, skip`); return; }
+-
+-    const git = this.stateManager.git;
+-    if (!git) { log(`onDiskCreate(${basename}): no git, skip`); return; }
+-
+-    let diskContent: string;
+-    try {
+-      diskContent = await fs.promises.readFile(filePath, 'utf-8');
+-    } catch {
+-      log(`onDiskCreate(${basename}): read failed, skip`);
+-      return;
+-    }
++  // ── change handling ─────────────────────────────────────────────────────────
++  //
++  // Only changes made by Claude Code's file tools (Edit, Write, ...) become hunks. Claude Code
++  // reports each such tool call through hooks (see claudeHooks.ts), including the file content
++  // right before and after it. Every other change (your own edits, Source Control actions,
++  // formatters, other tools) is folded into the baseline, so it never shows up as a hunk.
+ 
+-    const gitBaseline = await git.getBaseline(filePath);
+-    log(`onDiskCreate(${basename}): gitBaseline=${gitBaseline !== undefined ? `'${gitBaseline.length} chars'` : 'undefined'}`);
+-    if (gitBaseline !== undefined) {
+-      // Hunkwise already has a baseline — treat as a change
+-      log(`onDiskCreate(${basename}): has baseline, enterReviewing as change`);
+-      this.enterReviewing(filePath, gitBaseline, diskContent);
+-      return;
+-    }
+-
+-    // Check if this was a manual create in VSCode (editor buffer matches disk)
+-    const openDoc = vscode.workspace.textDocuments.find(d => normalizePath(d.uri.fsPath) === filePath);
+-    const bufferMatch = openDoc ? openDoc.getText() === diskContent : false;
+-    log(`onDiskCreate(${basename}): openDoc=${!!openDoc}, bufferMatch=${bufferMatch}`);
+-    if (openDoc && bufferMatch) {
+-      // User created/saved this file in VSCode — snapshot as baseline, no hunk
+-      log(`onDiskCreate(${basename}): buffer matches disk, snapshot as baseline`);
+-      this.stateManager.snapshotFile(filePath, diskContent);
+-      return;
+-    }
+-
+-    // External tool created this file — show as new file hunk (null = file didn't exist before)
+-    log(`onDiskCreate(${basename}): external create, enterReviewing as NEW`);
+-    this.enterReviewing(filePath, null, diskContent);
++  private isTracked(filePath: string): boolean {
++    return !this._suppressed && this.stateManager.enabled && !this.shouldIgnore(filePath) && !this.selfEditFiles.has(filePath);
+   }
+ 
+-  private async onDiskDelete(uri: vscode.Uri): Promise<void> {
+-    if (this._suppressed) return;
+-    if (!this.stateManager.enabled) return;
++  private onDiskCreate(uri: vscode.Uri): void {
+     const filePath = normalizePath(uri.fsPath);
+-    const basename = path.basename(filePath);
+-    if (this.shouldIgnore(filePath)) return;
+-    if (this.selfEditFiles.has(filePath)) return;
++    if (this.isTracked(filePath)) void this.onObservedChange(filePath);
++  }
+ 
+-    const fileState = this.stateManager.getFile(filePath);
+-    const git = this.stateManager.git;
++  private onDiskChange(uri: vscode.Uri): void {
++    const filePath = normalizePath(uri.fsPath);
++    if (this.isTracked(filePath)) void this.onObservedChange(filePath);
++  }
+ 
++  private onDiskDelete(uri: vscode.Uri): void {
++    const filePath = normalizePath(uri.fsPath);
++    if (!this.isTracked(filePath)) return;
+     if (this.pendingRenameOldPaths.has(filePath)) {
+       // User-initiated rename — renameFile already migrated state+git, nothing to do
+       this.pendingRenameOldPaths.delete(filePath);
+-      log(`onDiskDelete(${basename}): rename old path, skip`);
++      log(`onDiskDelete(${path.basename(filePath)}): rename old path, skip`);
+       return;
+     }
++    void this.onObservedChange(filePath, null);
++  }
+ 
+-    if (this.pendingUserDeletes.has(filePath)) {
+-      // User-initiated delete (explorer / VSCode API) — treat as manual, remove baseline.
+-      // Always go through stateManager.removeFile so git ops are serialized via gitQueue.
+-      this.pendingUserDeletes.delete(filePath);
+-      log(`onDiskDelete(${basename}): user delete, removeFile`);
+-      this.stateManager.removeFile(filePath);
+-      // Also clean up child files when a directory is deleted via VSCode
+-      const dirPrefix = filePath + path.sep;
+-      let needsRefresh = !!fileState;
+-      for (const [childPath] of this.stateManager.getAllFiles()) {
+-        if (childPath.startsWith(dirPrefix)) {
+-          this.stateManager.removeFile(childPath);
+-          needsRefresh = true;
+-        }
+-      }
+-      if (needsRefresh) {
+-        this.onStateChanged();
+-      }
+-      return;
++  private onDocumentChange(e: vscode.TextDocumentChangeEvent): void {
++    if (e.document.uri.scheme !== 'file' || e.contentChanges.length === 0) return;
++    const filePath = normalizePath(e.document.uri.fsPath);
++    if (!this.isTracked(filePath)) return;
++    if (this.stateManager.getFile(filePath)?.status !== 'reviewing') return;
++
++    // Handled synchronously (no debounce): this listener is registered before the decoration
++    // refresh in extension.ts, so the baseline is already updated when the hunks are redrawn.
++    // Otherwise your edit would flash as a hunk until the baseline caught up.
++    const doc = e.document;
++    if (doc.isDirty) {
++      // Unsaved typing is always yours. Its baseline goes to git once the file is saved.
++      void this.applyOtherChange(filePath, doc.getText(), false);
++    } else {
++      // Reloaded from disk, reverted, or undone back to the saved state.
++      void this.onObservedChange(filePath, doc.getText());
+     }
++  }
+ 
+-    // External tool deleted the file
+-    if (!git) { log(`onDiskDelete(${basename}): no git, skip`); return; }
++  /** A file changed. content is its new text, null when it was deleted, undefined to read it from disk. */
++  private async onObservedChange(filePath: string, content?: string | null): Promise<void> {
++    const current = content !== undefined ? content : await readText(filePath);
++    if (current === undefined) return; // Unreadable, e.g. a directory.
++    // A file that is gone again right after its create/change event gets its own delete event.
++    if (current === null && content === undefined && !this.stateManager.getFile(filePath)) return;
++    // With unsaved edits, the editor is newer than the disk (e.g. typing on after an auto save
++    // whose change event arrives late); onDocumentChange already handled that newer text.
++    if (content === undefined && current !== null && this.dirtyDocument(filePath)) return;
++    await this.applyOtherChange(filePath, current, true);
++  }
++
++  /** The open document for filePath if it has unsaved edits. */
++  private dirtyDocument(filePath: string): vscode.TextDocument | undefined {
++    return vscode.workspace.textDocuments.find(d => d.isDirty && d.uri.scheme === 'file' && normalizePath(d.uri.fsPath) === filePath);
++  }
+ 
+-    // If file was new (null baseline), just clean up — nothing to show, nothing in git
+-    if (fileState?.baseline === null) {
+-      log(`onDiskDelete(${basename}): new file (null baseline) deleted, removing fileState`);
+-      this.stateManager.exitReviewing(filePath);
++  /**
++   * Fold a change that Claude did not make into the baseline. Files under review keep only the
++   * Claude hunks that the change did not touch. persist=false keeps the new baseline in memory
++   * only (for unsaved edits).
++   */
++  private async applyOtherChange(filePath: string, content: string | null, persist: boolean): Promise<void> {
++    const basename = path.basename(filePath);
++    // Checking also reads new tool call events, so a call's start is always known before its write.
++    if (this.tracker?.isWorkingOn(filePath)) this.changedDuringClaude.add(filePath);
++    const state = this.stateManager.getFile(filePath);
++    if (!state) {
++      // Not under review: the baseline simply follows the file.
++      if (content === null) this.removeTree(filePath);
++      else this.stateManager.snapshotFile(filePath, content);
++      return;
++    }
++    if (content === null) {
++      log(`${basename}: deleted, dropping its hunks`);
++      this.removeTree(filePath);
+       this.onStateChanged();
+       return;
+     }
+-
+-    const gitBaseline = fileState?.baseline ?? await git.getBaseline(filePath);
+-    log(`onDiskDelete(${basename}): external delete, gitBaseline=${gitBaseline !== undefined ? `'${gitBaseline.length} chars'` : 'undefined'}`);
+-    if (gitBaseline === undefined) {
+-      // Not tracked at all — nothing to show
+-      if (fileState) {
+-        log(`onDiskDelete(${basename}): no baseline, removing fileState`);
+-        this.stateManager.removeFile(filePath);
+-        this.onStateChanged();
+-      }
+-
+-      // When a directory is externally deleted, VSCode's FileSystemWatcher only
+-      // fires onDidDelete for the directory itself, not for individual files
+-      // inside it. Clean up any child state entries whose paths start with this
+-      // directory prefix so they don't remain as stale ghosts in the panel.
+-      const dirPrefix = filePath + path.sep;
+-      const allFiles = this.stateManager.getAllFiles();
+-      let childrenCleaned = 0;
+-      for (const [childPath, childState] of allFiles) {
+-        if (!childPath.startsWith(dirPrefix)) continue;
+-        if (childState.baseline === null) {
+-          // New file (no git baseline) — just remove from state
+-          this.stateManager.exitReviewing(childPath);
+-        } else {
+-          // Has baseline — show deletion diff
+-          this.enterReviewing(childPath, childState.baseline, '');
+-        }
+-        childrenCleaned++;
+-      }
+-      if (childrenCleaned > 0) {
+-        log(`onDiskDelete(${basename}): cleaned ${childrenCleaned} child file(s) from deleted directory`);
+-        this.onStateChanged();
+-      }
++    const known = this.knownContent.get(filePath);
++    if (known === content) {
++      if (persist) this.persistBaseline(filePath);
+       return;
+     }
+-    // gitBaseline is '' (empty file) or has content — show deletion diff.
+-    // Pass '' as current content since file no longer exists on disk.
+-    // enterReviewing will detect isDeleted via !fs.existsSync.
+-    this.enterReviewing(filePath, gitBaseline, '');
++    if (known === undefined) log(`${basename}: previous content unknown, cannot separate this change from Claude's`);
++    const baseline = known === undefined ? state.baseline : rebaseBaseline(state.baseline, known, content);
++    this.knownContent.set(filePath, content);
++    if (computeHunks(baseline, content).length === 0) {
++      log(`${basename}: no Claude changes left after your change`);
++      this.stateManager.exitReviewing(filePath, content);
++      this.forget(filePath);
++    } else if (baseline !== state.baseline) {
++      log(`${basename}: folded your change into the baseline`);
++      this.stateManager.setFile(filePath, { status: 'reviewing', baseline }, !persist);
++      if (persist) this.unpersisted.delete(filePath);
++      else this.unpersisted.add(filePath);
++    } else if (persist) {
++      this.persistBaseline(filePath);
++    }
++    this.scheduleSaveKnown();
++    // For typing, the text change listener in extension.ts redraws right after this (cheaply);
++    // a full refresh on every keystroke would rebuild all hunk webviews and lag the editor.
++    if (persist || !this.stateManager.getFile(filePath)) this.onStateChanged();
+   }
+ 
+-  private async onDiskChange(uri: vscode.Uri): Promise<void> {
+-    const filePath = normalizePath(uri.fsPath);
+-    if (this._suppressed) return;
+-    if (!this.stateManager.enabled) return;
+-
+-    if (this.shouldIgnore(filePath)) return;
+-    if (this.selfEditFiles.has(filePath)) return;
++  private onClaudeToolStarted(event: { id: string; filePath: string }): void {
++    const filePath = this.toWorkspacePath(event.filePath);
++    if (!filePath) return;
++    const state = this.stateManager.getFile(filePath);
++    this.claudeSnapshots.set(event.id, { filePath, state: state ? { ...state } : undefined, known: this.knownContent.get(filePath) });
++  }
+ 
+-    let diskContent: string;
+-    try {
+-      diskContent = await fs.promises.readFile(filePath, 'utf-8');
+-    } catch {
+-      return;
++  private async onClaudeToolDone(event: { id: string; filePath: string; before: string | null | undefined; after: string | null | undefined }): Promise<void> {
++    const filePath = this.toWorkspacePath(event.filePath);
++    if (!filePath) return;
++    const snapshot = this.claudeSnapshots.get(event.id);
++    this.claudeSnapshots.delete(event.id);
++    const stillWorking = this.tracker?.isWorkingOn(filePath) ?? false;
++    const changedMeanwhile = this.changedDuringClaude.has(filePath);
++    if (!stillWorking) this.changedDuringClaude.delete(filePath);
++    if (this._suppressed || !this.stateManager.enabled || this.shouldIgnore(filePath)) return;
++
++    // Changes seen while the tool ran were handled as yours, including the tool's own write.
++    // Go back to the review state from before the call; the steps below replay them properly.
++    if (changedMeanwhile && snapshot?.state) {
++      this.stateManager.setFile(filePath, snapshot.state);
++      if (snapshot.known !== undefined) this.knownContent.set(filePath, snapshot.known);
++      else this.knownContent.delete(filePath);
+     }
+ 
+-    const fileState = this.stateManager.getFile(filePath);
++    const { before, after } = event;
++    if (before === undefined || after === undefined) {
++      log(`${path.basename(filePath)}: changed by Claude, but its content could not be captured, not shown`);
++    } else if (after !== null && before !== after) {
++      this.applyClaudeChange(filePath, before, after);
++    }
++    // Whatever changed the file after the tool call is not Claude's (unless another Claude call
++    // on this file is still running; its own report handles that).
++    if (stillWorking) return;
++    const disk = await readText(filePath);
++    if (disk === undefined || disk === after) return;
++    if (disk !== null && this.dirtyDocument(filePath)) return; // Unsaved edits are handled by onDocumentChange.
++    await this.applyOtherChange(filePath, disk, true);
++  }
+ 
+-    if (fileState?.status === 'reviewing') {
+-      // Already has diff — recompute against known baseline
+-      this.recomputeHunks(filePath, fileState.baseline, diskContent);
+-      return;
++  private applyClaudeChange(filePath: string, before: string | null, after: string): void {
++    const basename = path.basename(filePath);
++    const state = this.stateManager.getFile(filePath);
++    if (!state) {
++      if (before !== null && computeHunks(before, after).length === 0) return;
++      log(`reviewing: ${basename}${before === null ? ' (new)' : ''}, changed by Claude`);
++      // A new file must not keep a stale baseline from an earlier file at the same path.
++      if (before === null) this.stateManager.removeFile(filePath);
++      this.stateManager.setFile(filePath, { status: 'reviewing', baseline: before });
++    } else {
++      // Already under review: first fold in any change of yours from before the tool ran.
++      const known = this.knownContent.get(filePath);
++      let baseline = state.baseline;
++      if (known !== undefined && before !== null && known !== before) baseline = rebaseBaseline(baseline, known, before);
++      if (baseline !== null && computeHunks(baseline, after).length === 0) {
++        log(`${basename}: Claude undid its own changes`);
++        this.stateManager.exitReviewing(filePath, after);
++        this.forget(filePath);
++        this.onStateChanged();
++        return;
++      }
++      if (baseline !== state.baseline) this.stateManager.setFile(filePath, { status: 'reviewing', baseline });
++      log(`reviewing: ${basename}, changed by Claude again`);
+     }
++    this.knownContent.set(filePath, after);
++    this.scheduleSaveKnown();
++    this.onStateChanged();
++  }
+ 
+-    const git = this.stateManager.git;
+-    if (!git) return;
++  /** Map a path reported by Claude Code to this workspace's form of it, or undefined when outside the workspace. */
++  private toWorkspacePath(p: string): string | undefined {
++    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
++    if (!root) return undefined;
++    const rootKey = pathKey(root);
++    const key = pathKey(p);
++    if (key !== rootKey && !key.startsWith(rootKey.endsWith(path.sep) ? rootKey : rootKey + path.sep)) return undefined;
++    return normalizePath(path.join(root, path.resolve(p).slice(path.resolve(root).length)));
++  }
+ 
+-    // Check if this was a manual save in VSCode (editor buffer matches disk)
+-    const openDoc = vscode.workspace.textDocuments.find(d => normalizePath(d.uri.fsPath) === filePath);
+-    if (openDoc && openDoc.getText() === diskContent) {
+-      // User saved in VSCode — accept into baseline, no hunk
+-      this.stateManager.snapshotFile(filePath, diskContent);
+-      return;
++  /** Remove a deleted file or directory (and everything under it) from tracking. */
++  private removeTree(filePath: string): void {
++    this.stateManager.removeFile(filePath);
++    this.forget(filePath);
++    const prefix = filePath + path.sep;
++    for (const child of Array.from(this.stateManager.getAllFiles().keys())) {
++      if (child.startsWith(prefix)) {
++        this.stateManager.removeFile(child);
++        this.forget(child);
++      }
+     }
++  }
+ 
+-    // External change — compare against hunkwise baseline
+-    const gitBaseline = await git.getBaseline(filePath);
+-    if (gitBaseline === undefined) {
+-      // No baseline in git — silently adopt current content as baseline rather than
+-      // treating as a new file. This avoids false "new file" hunks in cases like:
+-      // - ignore rules just changed (file newly un-ignored, not actually new)
+-      // - syncIgnoreState hasn't finished its git queue yet
+-      // - first enable where snapshotWorkspace is still in progress
+-      // Genuine new files created while hunkwise is running are caught by onDidCreate,
+-      // not this path. This is intentionally consistent with syncIgnoreState's toAdd
+-      // behavior which also silently snapshots.
+-      this.stateManager.snapshotFile(filePath, diskContent);
+-      return;
+-    }
+-    this.enterReviewing(filePath, gitBaseline, diskContent);
++  private forget(filePath: string): void {
++    this.knownContent.delete(filePath);
++    this.unpersisted.delete(filePath);
++    this.scheduleSaveKnown();
+   }
+ 
+-  private onDocumentChange(e: vscode.TextDocumentChangeEvent): void {
+-    if (this._suppressed) return;
++  /** Save a baseline that was only updated in memory (for unsaved edits) to git. */
++  private persistBaseline(filePath: string): void {
++    if (!this.unpersisted.delete(filePath)) return;
++    const state = this.stateManager.getFile(filePath);
++    if (state?.status === 'reviewing') this.stateManager.setFile(filePath, state);
++  }
++
++  /**
++   * After loading state from git, only files that were under review before keep their hunks.
++   * Anything else that differs from its baseline changed while hunkwise was not running, which
++   * cannot be Claude's tool calls (hunkwise would have heard about those), so it is accepted.
++   */
++  async reconcileUnattributed(): Promise<void> {
+     if (!this.stateManager.enabled) return;
+-    if (e.document.uri.scheme !== 'file') return;
+-    const filePath = normalizePath(e.document.uri.fsPath);
++    if (!this.knownLoaded) this.loadKnown();
++    const accepted: string[] = [];
++    let kept = 0;
++    for (const [filePath, state] of Array.from(this.stateManager.getAllFiles())) {
++      if (state.status !== 'reviewing') continue;
++      const disk = await readText(filePath);
++      if (disk === undefined) continue;
++      const known = this.knownContent.get(filePath);
++      if (known === undefined) {
++        accepted.push(path.basename(filePath));
++        if (disk === null) this.stateManager.removeFile(filePath);
++        else this.stateManager.exitReviewing(filePath, disk);
++        continue;
++      }
++      kept++;
++      if (disk !== known) await this.applyOtherChange(filePath, disk, true);
++    }
++    if (accepted.length > 0) log(`reconcile: accepted ${accepted.length} change(s) not made by Claude: ${accepted.slice(0, 20).join(', ')}`);
++    log(`reconcile: ${kept} file(s) with Claude changes to review`);
++    this.scheduleSaveKnown();
++  }
+ 
+-    if (this.shouldIgnore(filePath)) return;
+-    if (this.selfEditFiles.has(filePath)) return;
+-
+-    const fileState = this.stateManager.getFile(filePath);
+-    if (fileState?.status !== 'reviewing') return;
+-
+-    // Already has diff — recompute hunks against baseline
+-    const existing = this.debounceTimers.get(filePath);
+-    if (existing) clearTimeout(existing);
+-    const timer = setTimeout(() => {
+-      this.debounceTimers.delete(filePath);
+-      const latestState = this.stateManager.getFile(filePath);
+-      if (!latestState || latestState.status !== 'reviewing') return;
+-      this.recomputeHunks(filePath, latestState.baseline, e.document.getText());
+-    }, 50);
+-    this.debounceTimers.set(filePath, timer);
+-  }
+-
+-  private enterReviewing(filePath: string, baseline: string | null, current: string): void {
+-    const hunks = computeHunks(baseline, current);
+-    const isNew = baseline === null;
+-    const isDeleted = !fs.existsSync(filePath) && baseline !== null;
+-    // Allow 0-hunk entry for new files (null baseline) and deleted files (file gone, nothing to diff)
+-    if (hunks.length === 0 && !isNew && !isDeleted) return;
+-    const tag = isNew ? ' (new)' : isDeleted ? ' (deleted)' : '';
+-    log(`reviewing: ${path.basename(filePath)}${tag}`);
+-    this.stateManager.setFile(filePath, { status: 'reviewing', baseline });
+-    this.onStateChanged();
++  private get knownPath(): string | undefined {
++    const dir = this.stateManager.dir;
++    // Inside the git dir, so it goes away together with the baselines on disable.
++    return dir ? path.join(dir, 'git', 'hunkwise-claude-reviewing.json') : undefined;
+   }
+ 
+-  private recomputeHunks(filePath: string, baseline: string | null, current: string): void {
+-    if (computeHunks(baseline, current).length === 0) {
+-      // No diff remaining — exit reviewing.
+-      // For null-baseline (new) files with empty current, keep reviewing
+-      // so the user can still accept/discard.
+-      if (baseline === null && current === '') {
+-        this.onStateChanged();
+-        return;
++  private loadKnown(): void {
++    this.knownLoaded = true;
++    const file = this.knownPath;
++    if (!file) return;
++    try {
++      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
++      for (const [filePath, content] of Object.entries(data?.files ?? {})) {
++        if (typeof content === 'string') this.knownContent.set(filePath, content);
+       }
+-      this.stateManager.exitReviewing(filePath);
++    } catch { /* nothing saved yet */ }
++  }
++
++  private scheduleSaveKnown(): void {
++    if (this.saveKnownTimer) return;
++    this.saveKnownTimer = setTimeout(() => {
++      this.saveKnownTimer = undefined;
++      this.saveKnown();
++    }, 500);
++  }
++
++  private flushKnown(): void {
++    if (!this.saveKnownTimer) return;
++    clearTimeout(this.saveKnownTimer);
++    this.saveKnownTimer = undefined;
++    this.saveKnown();
++  }
++
++  private saveKnown(): void {
++    const file = this.knownPath;
++    if (!file || !this.knownLoaded || !this.stateManager.enabled || !fs.existsSync(path.dirname(file))) return;
++    const files: Record<string, string> = {};
++    for (const [filePath, content] of this.knownContent) {
++      if (this.stateManager.getFile(filePath)?.status === 'reviewing') files[filePath] = content;
++      else this.knownContent.delete(filePath);
++    }
++    try {
++      fs.writeFileSync(file, JSON.stringify({ version: 1, files }), 'utf-8');
++    } catch (err) {
++      log(`saving review state failed: ${err}`);
+     }
+-    this.onStateChanged();
+   }
+ 
+   dispose(): void {
+@@ -510,8 +602,17 @@ export class FileWatcher {
+       clearTimeout(timer);
+     }
+     this.debounceTimers.clear();
+-    this.pendingUserDeletes.clear();
++    this.flushKnown();
+     this.pendingRenameOldPaths.clear();
+     this.disposables.forEach(d => d.dispose());
+   }
+ }
++
++/** Read a text file: null when it does not exist, undefined when it cannot be read. */
++async function readText(filePath: string): Promise<string | null | undefined> {
++  try {
++    return await fs.promises.readFile(filePath, 'utf-8');
++  } catch (err: any) {
++    return err?.code === 'ENOENT' ? null : undefined;
++  }
++}
+diff --git a/src/hunkwiseGit.ts b/src/hunkwiseGit.ts
+index 8e0ff05..17c445d 100644
+--- a/src/hunkwiseGit.ts
++++ b/src/hunkwiseGit.ts
+@@ -76,6 +76,11 @@ export class HunkwiseGit {
+     return stdout;
+   }
+ 
++  /** Workspace-relative path in git index form (forward slashes, even on Windows). */
++  private toRel(filePath: string): string {
++    return normalizePath(path.relative(this.workTree, filePath)).split(path.sep).join('/');
++  }
++
+   // ── settings.json ─────────────────────────────────────────────────────────
+ 
+   private get settingsPath(): string {
+@@ -185,7 +190,7 @@ export class HunkwiseGit {
+    */
+   async snapshot(filePath: string, content: string): Promise<void> {
+     await this.initGit();
+-    const rel = normalizePath(path.relative(this.workTree, filePath));
++    const rel = this.toRel(filePath);
+     try {
+       const hash = await new Promise<string>((resolve, reject) => {
+         const child = execFile(
+@@ -210,8 +215,8 @@ export class HunkwiseGit {
+    */
+   async renameFile(oldFilePath: string, newFilePath: string): Promise<void> {
+     await this.initGit();
+-    const oldRel = normalizePath(path.relative(this.workTree, oldFilePath));
+-    const newRel = normalizePath(path.relative(this.workTree, newFilePath));
++    const oldRel = this.toRel(oldFilePath);
++    const newRel = this.toRel(newFilePath);
+     try {
+       // ls-files returns all entries matching the path (a single file or all files under a directory)
+       const lsOut = await this.git(['ls-files', '--stage', '--', oldRel]);
+@@ -255,7 +260,7 @@ export class HunkwiseGit {
+    */
+   async removeFile(filePath: string): Promise<void> {
+     await this.initGit();
+-    const rel = normalizePath(path.relative(this.workTree, filePath));
++    const rel = this.toRel(filePath);
+     try {
+       const lsOut = await this.git(['ls-files', '--stage', '--', rel]);
+       if (!lsOut.trim()) return; // not tracked — nothing to remove
+@@ -279,7 +284,7 @@ export class HunkwiseGit {
+       const entries = await Promise.all(
+         files.map(({ filePath, content }) =>
+           new Promise<{ rel: string; hash: string }>((resolve, reject) => {
+-            const rel = normalizePath(path.relative(this.workTree, filePath));
++            const rel = this.toRel(filePath);
+             const child = execFile(
+               'git',
+               ['hash-object', '-w', '--stdin'],
+@@ -310,7 +315,7 @@ export class HunkwiseGit {
+     if (filePaths.length === 0) return;
+     await this.initGit();
+     try {
+-      const rels = filePaths.map(fp => normalizePath(path.relative(this.workTree, fp)));
++      const rels = filePaths.map(fp => this.toRel(fp));
+       // Chunk to avoid exceeding OS argument length limits (~250KB on macOS)
+       const CHUNK = 200;
+       for (let i = 0; i < rels.length; i += CHUNK) {
+@@ -336,7 +341,7 @@ export class HunkwiseGit {
+    */
+   async getBaseline(filePath: string): Promise<string | undefined> {
+     await this.initGit();
+-    const rel = normalizePath(path.relative(this.workTree, filePath));
++    const rel = this.toRel(filePath);
+     try {
+       return await this.git(['show', `:${rel}`]);
+     } catch {
+diff --git a/src/reviewPanel.ts b/src/reviewPanel.ts
+index 92e57f6..cf12619 100644
+--- a/src/reviewPanel.ts
++++ b/src/reviewPanel.ts
+@@ -52,6 +52,7 @@ interface PanelHunk {
+ export class ReviewPanel implements vscode.WebviewViewProvider {
+   private view?: vscode.WebviewView;
+   private _loading: boolean = false;
++  private refreshTimer: NodeJS.Timeout | undefined;
+ 
+   get loading(): boolean { return this._loading; }
+ 
+@@ -88,11 +89,21 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
+   }
+ 
+   refresh(): void {
++    if (this.refreshTimer) {
++      clearTimeout(this.refreshTimer);
++      this.refreshTimer = undefined;
++    }
+     if (!this.view || this._loading) return;
+     const state = this.buildPanelState();
+     this.view.webview.postMessage({ type: 'update', state });
+   }
+ 
++  /** Refresh once typing pauses; rebuilding the panel state rediffs every file under review. */
++  refreshSoon(): void {
++    if (this.refreshTimer) clearTimeout(this.refreshTimer);
++    this.refreshTimer = setTimeout(() => this.refresh(), 300);
++  }
++
+   setLoading(loading: boolean): void {
+     this._loading = loading;
+     if (!this.view) return;
+diff --git a/src/stateManager.ts b/src/stateManager.ts
+index 505450d..26dd60b 100644
+--- a/src/stateManager.ts
++++ b/src/stateManager.ts
+@@ -38,14 +38,23 @@ export class StateManager {
+   // Set by the extension to trigger UI refresh after unexpected state restoration.
+   onRollback: (() => void) | undefined;
+ 
+-  constructor() {
++  // storageDir: where to keep settings.json + git/. Defaults to
++  // <workspace>/.vscode/hunkwise when not given.
++  constructor(storageDir?: string) {
+     const workspaceFolders = vscode.workspace.workspaceFolders;
+     if (workspaceFolders && workspaceFolders.length > 0) {
+       this.workspaceRoot = workspaceFolders[0].uri.fsPath;
+-      this.hunkwiseDir = path.join(this.workspaceRoot, '.vscode', 'hunkwise');
++      this.hunkwiseDir = storageDir ?? path.join(this.workspaceRoot, '.vscode', 'hunkwise');
+     }
+   }
+ 
++  /** True when the hunkwise dir lives inside the workspace (and so needs a .gitignore entry). */
++  get dirInWorkspace(): boolean {
++    if (!this.hunkwiseDir || !this.workspaceRoot) return false;
++    const rel = path.relative(this.workspaceRoot, this.hunkwiseDir);
++    return !rel.startsWith('..') && !path.isAbsolute(rel);
++  }
++
+   // ── accessors ─────────────────────────────────────────────────────────────
+ 
+   get enabled(): boolean { return this._enabled; }
+diff --git a/src/test/claudeHooks.test.ts b/src/test/claudeHooks.test.ts
+new file mode 100644
+index 0000000..360b0b8
+--- /dev/null
++++ b/src/test/claudeHooks.test.ts
+@@ -0,0 +1,224 @@
++import { describe, it, beforeEach, afterEach } from 'node:test';
++import assert from 'node:assert/strict';
++import * as fs from 'fs';
++import * as http from 'http';
++import * as net from 'net';
++import * as os from 'os';
++import * as path from 'path';
++import { ClaudeHookServer, ClaudeToolEvent, ClaudeToolTracker, HOOK_PATH } from '../claudeHooks';
++
++let tmpDir: string;
++let eventsDir: string;
++let file: string;
++const servers: ClaudeHookServer[] = [];
++const trackers: ClaudeToolTracker[] = [];
++
++function freePort(): Promise<number> {
++  return new Promise((resolve, reject) => {
++    const probe = net.createServer();
++    probe.once('error', reject);
++    probe.listen(0, '127.0.0.1', () => {
++      const port = (probe.address() as net.AddressInfo).port;
++      probe.close(() => resolve(port));
++    });
++  });
++}
++
++function sleep(ms: number): Promise<void> {
++  return new Promise(resolve => setTimeout(resolve, ms));
++}
++
++async function waitFor(condition: () => boolean, timeoutMs = 5000): Promise<void> {
++  const start = Date.now();
++  while (!condition()) {
++    if (Date.now() - start > timeoutMs) throw new Error('Condition not met in time');
++    await sleep(20);
++  }
++}
++
++/** Send a hook request the way Claude Code does. */
++function post(port: number, body: unknown, headers: Record<string, string> = {}, method = 'POST'): Promise<number> {
++  return new Promise((resolve, reject) => {
++    const data = JSON.stringify(body);
++    const req = http.request(
++      { host: '127.0.0.1', port, path: HOOK_PATH, method, headers: { 'Content-Type': 'application/json', ...headers } },
++      res => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); },
++    );
++    req.on('error', reject);
++    req.end(data);
++  });
++}
++
++function hookInput(event: string, tool: string, toolInput: Record<string, unknown>, id = 'toolu_1'): Record<string, unknown> {
++  return { session_id: 's1', cwd: tmpDir, hook_event_name: event, tool_name: tool, tool_input: toolInput, tool_use_id: id };
++}
++
++function readEvents(): ClaudeToolEvent[] {
++  return fs.readdirSync(eventsDir)
++    .filter(n => n.endsWith('.json'))
++    .sort()
++    .map(n => JSON.parse(fs.readFileSync(path.join(eventsDir, n), 'utf-8')));
++}
++
++function newServer(port: number): ClaudeHookServer {
++  const server = new ClaudeHookServer(port, eventsDir);
++  servers.push(server);
++  return server;
++}
++
++beforeEach(() => {
++  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-hooks-test-'));
++  eventsDir = path.join(tmpDir, 'events');
++  file = path.join(tmpDir, 'file.txt');
++  fs.writeFileSync(file, 'original\n');
++});
++
++afterEach(() => {
++  servers.splice(0).forEach(s => s.dispose());
++  trackers.splice(0).forEach(t => t.dispose());
++  fs.rmSync(tmpDir, { recursive: true, force: true });
++});
++
++describe('ClaudeHookServer', () => {
++  it('records an Edit call with the file content before and after', async () => {
++    const port = await freePort();
++    const server = newServer(port);
++    server.start();
++    await waitFor(() => server.listening);
++
++    assert.equal(await post(port, hookInput('PreToolUse', 'Edit', { file_path: file })), 200);
++    fs.writeFileSync(file, 'changed\n');
++    assert.equal(await post(port, hookInput('PostToolUse', 'Edit', { file_path: file })), 200);
++
++    const [pre, done] = readEvents();
++    assert.equal(pre.kind, 'pre');
++    assert.equal(pre.before, 'original\n');
++    assert.equal(done.kind, 'post');
++    assert.equal(done.before, 'original\n');
++    assert.equal(done.after, 'changed\n');
++    assert.equal(done.id, 'toolu_1');
++  });
++
++  it('records a Write that creates a file with a null before', async () => {
++    const port = await freePort();
++    const server = newServer(port);
++    server.start();
++    await waitFor(() => server.listening);
++    const created = path.join(tmpDir, 'new.txt');
++
++    await post(port, hookInput('PreToolUse', 'Write', { file_path: 'new.txt', content: 'x' }));
++    fs.writeFileSync(created, 'x');
++    await post(port, hookInput('PostToolUse', 'Write', { file_path: 'new.txt', content: 'x' }));
++
++    const [pre, done] = readEvents();
++    assert.equal(pre.filePath, created, 'Relative paths are resolved against the hook cwd');
++    assert.equal(pre.before, null);
++    assert.equal(done.after, 'x');
++  });
++
++  it('ignores tools that do not name the file they change, such as Bash', async () => {
++    const port = await freePort();
++    const server = newServer(port);
++    server.start();
++    await waitFor(() => server.listening);
++
++    assert.equal(await post(port, hookInput('PreToolUse', 'Bash', { command: 'rm file.txt' })), 200);
++    assert.equal(fs.existsSync(eventsDir) ? readEvents().length : 0, 0);
++  });
++
++  it('rejects requests that do not look like Claude Code hooks', async () => {
++    const port = await freePort();
++    const server = newServer(port);
++    server.start();
++    await waitFor(() => server.listening);
++    const input = hookInput('PreToolUse', 'Edit', { file_path: file });
++
++    assert.equal(await post(port, input, { 'Content-Type': 'text/plain' }), 403);
++    assert.equal(await post(port, input, { Host: `evil.example:${port}` }), 403);
++    assert.equal(await post(port, input, {}, 'GET'), 404);
++    assert.equal(fs.existsSync(eventsDir) ? readEvents().length : 0, 0);
++  });
++
++  it('lets a second window take over the port when the first one closes', async () => {
++    const port = await freePort();
++    const first = newServer(port);
++    first.start();
++    await waitFor(() => first.listening);
++    const second = newServer(port);
++    second.start();
++    await sleep(200);
++    assert.ok(!second.listening, 'Only one window can listen');
++
++    first.dispose();
++    await waitFor(() => second.listening, 6000);
++  });
++});
++
++describe('ClaudeToolTracker', () => {
++  function newTracker() {
++    const started: { id: string; filePath: string }[] = [];
++    const done: { id: string; filePath: string; before: string | null | undefined; after: string | null | undefined }[] = [];
++    const abandoned: { id: string; filePath: string }[] = [];
++    const tracker = new ClaudeToolTracker(eventsDir, {
++      onToolStarted: e => started.push(e),
++      onToolDone: e => done.push(e),
++      onAbandoned: e => abandoned.push(e),
++    });
++    trackers.push(tracker);
++    tracker.start();
++    return { tracker, started, done, abandoned };
++  }
++
++  it('knows a file is being worked on between the pre and post events', () => {
++    const server = newServer(0);
++    const { tracker, started, done } = newTracker();
++
++    server.process(hookInput('PreToolUse', 'Edit', { file_path: file }));
++    assert.ok(tracker.isWorkingOn(file));
++    assert.deepEqual(started, [{ id: 'toolu_1', filePath: file }], 'The start is reported before the tool writes');
++    if (process.platform === 'win32') assert.ok(tracker.isWorkingOn(file.toUpperCase()), 'Windows paths match case-insensitively');
++    assert.ok(!tracker.isWorkingOn(path.join(tmpDir, 'other.txt')));
++
++    fs.writeFileSync(file, 'changed\n');
++    server.process(hookInput('PostToolUse', 'Edit', { file_path: file }));
++    assert.ok(!tracker.isWorkingOn(file));
++    assert.deepEqual(done, [{ id: 'toolu_1', filePath: file, before: 'original\n', after: 'changed\n' }]);
++  });
++
++  it('treats a failed tool call as finished', () => {
++    const server = newServer(0);
++    const { tracker, done } = newTracker();
++    server.process(hookInput('PreToolUse', 'Edit', { file_path: file }));
++    server.process(hookInput('PostToolUseFailure', 'Edit', { file_path: file }));
++    tracker.catchUp();
++    assert.equal(done.length, 1);
++    assert.equal(done[0].before, done[0].after);
++  });
++
++  it('reports a denied tool call as abandoned', () => {
++    const server = newServer(0);
++    const { tracker, done, abandoned } = newTracker();
++    server.process(hookInput('PreToolUse', 'Write', { file_path: file }));
++    server.process(hookInput('PermissionDenied', 'Write', { file_path: file }));
++    assert.ok(!tracker.isWorkingOn(file));
++    assert.deepEqual(abandoned, [{ id: 'toolu_1', filePath: file }]);
++    assert.equal(done.length, 0);
++  });
++
++  it('ignores events from before it started', () => {
++    const server = newServer(0);
++    server.process(hookInput('PreToolUse', 'Edit', { file_path: file }));
++    const { tracker } = newTracker();
++    assert.ok(!tracker.isWorkingOn(file));
++  });
++
++  it('uses the before content from the post event when it missed the pre event', () => {
++    const server = newServer(0);
++    server.process(hookInput('PreToolUse', 'Edit', { file_path: file }));
++    const { tracker, done } = newTracker();
++    fs.writeFileSync(file, 'changed\n');
++    server.process(hookInput('PostToolUse', 'Edit', { file_path: file }));
++    tracker.catchUp();
++    assert.deepEqual(done, [{ id: 'toolu_1', filePath: file, before: 'original\n', after: 'changed\n' }]);
++  });
++});
+diff --git a/src/test/rebaseBaseline.test.ts b/src/test/rebaseBaseline.test.ts
+new file mode 100644
+index 0000000..e0bf323
+--- /dev/null
++++ b/src/test/rebaseBaseline.test.ts
+@@ -0,0 +1,99 @@
++import { describe, it } from 'node:test';
++import assert from 'node:assert/strict';
++import { computeHunks, rebaseBaseline } from '../diffEngine';
++
++/** Join lines into file content with a trailing newline. */
++function lines(...ls: string[]): string {
++  return ls.map(l => l + '\n').join('');
++}
++
++describe('rebaseBaseline', () => {
++  it('keeps pending hunks and absorbs an unrelated change', () => {
++    const baseline = lines('a', 'b', 'c', 'd', 'e', 'f');
++    const before = lines('a', 'B', 'c', 'd', 'e', 'f');
++    const after = lines('a', 'B', 'c', 'd', 'e', 'F', 'g');
++    const result = rebaseBaseline(baseline, before, after);
++    assert.equal(result, lines('a', 'b', 'c', 'd', 'e', 'F', 'g'));
++    const hunks = computeHunks(result, after);
++    assert.equal(hunks.length, 1);
++    assert.deepEqual(hunks[0].removedContent, ['b']);
++    assert.deepEqual(hunks[0].addedContent, ['B']);
++  });
++
++  it('drops a pending hunk that the change touches', () => {
++    const result = rebaseBaseline(lines('a', 'b', 'c'), lines('a', 'B', 'c'), lines('a', 'X', 'c'));
++    assert.deepEqual(computeHunks(result, lines('a', 'X', 'c')), []);
++  });
++
++  it('keeps an untouched hunk while dropping a touched one', () => {
++    const baseline = lines('a', 'b', 'c', 'd', 'e', 'f');
++    const before = lines('a', 'B', 'c', 'd', 'E', 'f');
++    const after = lines('a', 'B', 'c', 'd', 'Z', 'f');
++    const result = rebaseBaseline(baseline, before, after);
++    assert.equal(result, lines('a', 'b', 'c', 'd', 'Z', 'f'));
++    const hunks = computeHunks(result, after);
++    assert.equal(hunks.length, 1);
++    assert.deepEqual(hunks[0].addedContent, ['B']);
++  });
++
++  it('shifts kept hunks past inserted and removed lines', () => {
++    const baseline = lines('a', 'b', 'c', 'd');
++    const before = lines('a', 'b', 'c', 'D');
++    const after = lines('x', 'y', 'a', 'c', 'D');
++    const result = rebaseBaseline(baseline, before, after);
++    assert.equal(result, lines('x', 'y', 'a', 'c', 'd'));
++    const hunks = computeHunks(result, after);
++    assert.equal(hunks.length, 1);
++    assert.deepEqual(hunks[0].removedContent, ['d']);
++    assert.deepEqual(hunks[0].addedContent, ['D']);
++  });
++
++  it('treats a full revert (e.g. Discard Changes in Source Control) as handling every hunk', () => {
++    const head = lines('a', 'b', 'c');
++    const baseline = lines('a', 'b', 'mine', 'c');
++    const before = lines('A', 'b', 'mine', 'c', 'claude');
++    const result = rebaseBaseline(baseline, before, head);
++    assert.deepEqual(computeHunks(result, head), []);
++  });
++
++  it('keeps a pending insertion when the change inserts right after it', () => {
++    const baseline = lines('a', 'b', 'c');
++    const before = lines('a', 'b', 'NEW', 'c');
++    const after = lines('a', 'b', 'NEW', 'U', 'c');
++    const result = rebaseBaseline(baseline, before, after);
++    assert.equal(result, lines('a', 'b', 'U', 'c'));
++    const hunks = computeHunks(result, after);
++    assert.equal(hunks.length, 1);
++    assert.deepEqual(hunks[0].addedContent, ['NEW']);
++  });
++
++  it('keeps a pending deletion when an unrelated line is added elsewhere', () => {
++    const baseline = lines('a', 'gone', 'b', 'c');
++    const before = lines('a', 'b', 'c');
++    const after = lines('a', 'b', 'c', 'd');
++    const result = rebaseBaseline(baseline, before, after);
++    assert.equal(result, lines('a', 'gone', 'b', 'c', 'd'));
++    const hunks = computeHunks(result, after);
++    assert.equal(hunks.length, 1);
++    assert.deepEqual(hunks[0].removedContent, ['gone']);
++  });
++
++  it('accepts a file created by the tool once the change edits it', () => {
++    const after = lines('x', 'Y');
++    const result = rebaseBaseline(null, lines('x', 'y'), after);
++    assert.equal(result, after);
++  });
++
++  it('handles content without a trailing newline', () => {
++    const result = rebaseBaseline('a\nb', 'a\nB', 'Z\na\nB');
++    assert.equal(result, 'Z\na\nb');
++    const hunks = computeHunks(result, 'Z\na\nB');
++    assert.equal(hunks.length, 1);
++    assert.deepEqual(hunks[0].removedContent, ['b']);
++  });
++
++  it('returns after unchanged when nothing was pending', () => {
++    const text = lines('a', 'b');
++    assert.equal(rebaseBaseline(text, text, lines('a', 'b', 'c')), lines('a', 'b', 'c'));
++  });
++});
+diff --git a/tsconfig.test.json b/tsconfig.test.json
+index 6dac5fd..c8e1b21 100644
+--- a/tsconfig.test.json
++++ b/tsconfig.test.json
+@@ -14,7 +14,9 @@
+     "src/diffEngine.ts",
+     "src/hunkwiseGit.ts",
+     "src/gitignoreManager.ts",
+-    "src/pathNormalize.ts"
++    "src/pathNormalize.ts",
++    "src/claudeHooks.ts",
++    "src/log.ts"
+   ],
+   "exclude": [
+     "node_modules",
