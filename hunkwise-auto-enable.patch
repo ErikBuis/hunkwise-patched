@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index dc122e2..db5e22d 100644
+index dc122e2..1e64327 100644
 --- a/README.md
 +++ b/README.md
 @@ -18,11 +18,11 @@ AI coding tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-cod
@@ -21,7 +21,7 @@ index dc122e2..db5e22d 100644
  ### Automatic tracking
  
 -Once enabled, any external tool (AI assistant, script, etc.) that writes to a file will automatically trigger review mode for that file.
-+Once enabled, every file that Claude Code changes with its Edit, Write or NotebookEdit tool automatically enters review mode. This works through Claude Code hooks that hunkwise receives on `http://127.0.0.1:47821/hunkwise/claude-hook`; `install.ps1` registers them in `~/.claude/settings.json`. Files Claude changes through Bash (e.g. `sed`, scripts, git) are not tracked, because they cannot be attributed to Claude without false positives.
++Once enabled, every file that Claude Code changes with its Edit, Write or NotebookEdit tool automatically enters review mode. This works through Claude Code hooks that hunkwise receives on `http://127.0.0.1:47821/hunkwise/claude-hook`; the installer from the hunkwise-patched repo (`install.ps1` on Windows, `install.sh` on Linux, macOS and in dev containers) registers them in `~/.claude/settings.json`. Files Claude changes through Bash (e.g. `sed`, scripts, git) are not tracked, because they cannot be attributed to Claude without false positives.
  
  ### Reviewing changes
  
@@ -670,7 +670,7 @@ index d78cdf8..668cf3a 100644
      onStateChanged();
    }
 diff --git a/src/fileWatcher.ts b/src/fileWatcher.ts
-index f1ef23e..e9d7921 100644
+index f1ef23e..b5a649c 100644
 --- a/src/fileWatcher.ts
 +++ b/src/fileWatcher.ts
 @@ -5,9 +5,11 @@ import * as path from 'path';
@@ -686,7 +686,13 @@ index f1ef23e..e9d7921 100644
  
  // Transform gitignore rules from a sub-directory so they work in a single
  // root-level matcher. Adds the directory's relative path as prefix, handling
-@@ -39,11 +41,23 @@ function prefixGitignoreRules(content: string, prefix: string): string {
+@@ -36,14 +38,31 @@ function prefixGitignoreRules(content: string, prefix: string): string {
+   }).join('\n');
+ }
+ 
++// How often files under review are compared with the disk, for changes the file watcher missed.
++const REVIEW_POLL_MS = 2000;
++
  export class FileWatcher {
    private disposables: vscode.Disposable[] = [];
    private selfEditFiles: Set<string> = new Set();
@@ -709,10 +715,12 @@ index f1ef23e..e9d7921 100644
 +  // reports back, the file is reset to this state and the changes are replayed correctly.
 +  private claudeSnapshots: Map<string, { filePath: string; state: FileState | undefined; known: string | undefined }> = new Map();
 +  private changedDuringClaude: Set<string> = new Set();
++  private reviewPollTimer: NodeJS.Timeout | undefined;
++  private polling = false;
    private onStateChanged: () => void;
    private onIgnoreRulesChanged: (() => void) | undefined;
    // Compiled ignore instance from workspace .gitignore
-@@ -75,23 +89,7 @@ export class FileWatcher {
+@@ -75,23 +94,7 @@ export class FileWatcher {
      watcher.onDidCreate(uri => this.onDiskCreate(uri));
      this.disposables.push(watcher);
  
@@ -736,7 +744,7 @@ index f1ef23e..e9d7921 100644
        // onWillRenameFiles fires BEFORE the actual rename. Record paths so
        // the subsequent onDiskDelete/onDiskCreate events are suppressed, and
        // migrate state+git. UI refresh is deferred to onDidRenameFiles because
-@@ -105,6 +103,13 @@ export class FileWatcher {
+@@ -105,6 +108,13 @@ export class FileWatcher {
            this.pendingRenameOldPaths.add(oldPath);
            this.selfEditFiles.add(newPath);
            this.stateManager.renameFile(oldPath, newPath);
@@ -750,7 +758,7 @@ index f1ef23e..e9d7921 100644
          }
        }),
        vscode.workspace.onDidRenameFiles(e => {
-@@ -125,6 +130,37 @@ export class FileWatcher {
+@@ -125,6 +135,47 @@ export class FileWatcher {
      });
      this.disposables.push(docChange);
  
@@ -783,12 +791,22 @@ index f1ef23e..e9d7921 100644
 +      log(`claude hooks: cannot follow Claude Code tool calls: ${err}`);
 +      this.tracker = undefined;
 +    }
-+    this.disposables.push({ dispose: () => { this.hookServer?.dispose(); this.tracker?.dispose(); this.flushKnown(); } });
++    // Some file systems never report changes to VSCode's file watcher (e.g. a Windows folder
++    // mounted into a dev container), so also check the files under review regularly.
++    this.reviewPollTimer = setInterval(() => { void this.pollReviewed(); }, REVIEW_POLL_MS);
++    this.disposables.push({
++      dispose: () => {
++        clearInterval(this.reviewPollTimer);
++        this.hookServer?.dispose();
++        this.tracker?.dispose();
++        this.flushKnown();
++      },
++    });
 +
      context.subscriptions.push(...this.disposables);
    }
  
-@@ -208,7 +244,16 @@ export class FileWatcher {
+@@ -208,7 +259,16 @@ export class FileWatcher {
    }
  
    clearSelfEdit(filePath: string): void {
@@ -806,7 +824,18 @@ index f1ef23e..e9d7921 100644
    }
  
    shouldIgnore(filePath: string, isDirectory?: boolean): boolean {
-@@ -253,256 +298,303 @@ export class FileWatcher {
+@@ -238,7 +298,9 @@ export class FileWatcher {
+ 
+     relPath = relPath.replace(/\\/g, '/');
+     if (!relPath || relPath === '.') return false;
+-    if (relPath.startsWith('..')) return false;
++    // Outside the workspace. asRelativePath() returns such paths unchanged, and the ignore
++    // library throws on absolute paths ("/home/..." on Linux and macOS).
++    if (relPath.startsWith('..') || path.isAbsolute(relPath)) return false;
+ 
+     // The `ignore` library requires a trailing slash to match directory-only
+     // patterns (e.g. `.vscode-test/`). Without it, `ignores('.vscode-test')`
+@@ -253,256 +315,328 @@ export class FileWatcher {
      return false;
    }
  
@@ -834,7 +863,13 @@ index f1ef23e..e9d7921 100644
 -      return;
 -    }
 -    if (fileState) { log(`onDiskCreate(${basename}): has fileState but not reviewing, skip`); return; }
--
++  // ── change handling ─────────────────────────────────────────────────────────
++  //
++  // Only changes made by Claude Code's file tools (Edit, Write, ...) become hunks. Claude Code
++  // reports each such tool call through hooks (see claudeHooks.ts), including the file content
++  // right before and after it. Every other change (your own edits, Source Control actions,
++  // formatters, other tools) is folded into the baseline, so it never shows up as a hunk.
+ 
 -    const git = this.stateManager.git;
 -    if (!git) { log(`onDiskCreate(${basename}): no git, skip`); return; }
 -
@@ -845,13 +880,7 @@ index f1ef23e..e9d7921 100644
 -      log(`onDiskCreate(${basename}): read failed, skip`);
 -      return;
 -    }
-+  // ── change handling ─────────────────────────────────────────────────────────
-+  //
-+  // Only changes made by Claude Code's file tools (Edit, Write, ...) become hunks. Claude Code
-+  // reports each such tool call through hooks (see claudeHooks.ts), including the file content
-+  // right before and after it. Every other change (your own edits, Source Control actions,
-+  // formatters, other tools) is folded into the baseline, so it never shows up as a hunk.
- 
+-
 -    const gitBaseline = await git.getBaseline(filePath);
 -    log(`onDiskCreate(${basename}): gitBaseline=${gitBaseline !== undefined ? `'${gitBaseline.length} chars'` : 'undefined'}`);
 -    if (gitBaseline !== undefined) {
@@ -1063,6 +1092,33 @@ index f1ef23e..e9d7921 100644
 -
 -    if (this.shouldIgnore(filePath)) return;
 -    if (this.selfEditFiles.has(filePath)) return;
+-
+-    let diskContent: string;
++  /** Handle changes to files under review that no file watcher or document event reported. */
++  private async pollReviewed(): Promise<void> {
++    if (this.polling || this._suppressed || !this.stateManager.enabled) return;
++    this.polling = true;
+     try {
+-      diskContent = await fs.promises.readFile(filePath, 'utf-8');
+-    } catch {
+-      return;
++      for (const [filePath, state] of Array.from(this.stateManager.getAllFiles())) {
++        if (state.status !== 'reviewing' || !this.isTracked(filePath)) continue;
++        const known = this.knownContent.get(filePath);
++        // A running Claude tool call reports its own change when it finishes, and unsaved edits
++        // are handled by onDocumentChange.
++        if (known === undefined || this.tracker?.isWorkingOn(filePath) || this.dirtyDocument(filePath)) continue;
++        const disk = await readText(filePath);
++        if (disk === undefined || disk === known) continue;
++        log(`${path.basename(filePath)}: changed on disk without a file watcher event`);
++        await this.onObservedChange(filePath);
++      }
++    } finally {
++      this.polling = false;
+     }
++  }
+ 
+-    const fileState = this.stateManager.getFile(filePath);
 +  private onClaudeToolStarted(event: { id: string; filePath: string }): void {
 +    const filePath = this.toWorkspacePath(event.filePath);
 +    if (!filePath) return;
@@ -1070,10 +1126,9 @@ index f1ef23e..e9d7921 100644
 +    this.claudeSnapshots.set(event.id, { filePath, state: state ? { ...state } : undefined, known: this.knownContent.get(filePath) });
 +  }
  
--    let diskContent: string;
--    try {
--      diskContent = await fs.promises.readFile(filePath, 'utf-8');
--    } catch {
+-    if (fileState?.status === 'reviewing') {
+-      // Already has diff — recompute against known baseline
+-      this.recomputeHunks(filePath, fileState.baseline, diskContent);
 -      return;
 +  private async onClaudeToolDone(event: { id: string; filePath: string; before: string | null | undefined; after: string | null | undefined }): Promise<void> {
 +    const filePath = this.toWorkspacePath(event.filePath);
@@ -1093,7 +1148,8 @@ index f1ef23e..e9d7921 100644
 +      else this.knownContent.delete(filePath);
      }
  
--    const fileState = this.stateManager.getFile(filePath);
+-    const git = this.stateManager.git;
+-    if (!git) return;
 +    const { before, after } = event;
 +    if (before === undefined || after === undefined) {
 +      log(`${path.basename(filePath)}: changed by Claude, but its content could not be captured, not shown`);
@@ -1109,9 +1165,11 @@ index f1ef23e..e9d7921 100644
 +    await this.applyOtherChange(filePath, disk, true);
 +  }
  
--    if (fileState?.status === 'reviewing') {
--      // Already has diff — recompute against known baseline
--      this.recomputeHunks(filePath, fileState.baseline, diskContent);
+-    // Check if this was a manual save in VSCode (editor buffer matches disk)
+-    const openDoc = vscode.workspace.textDocuments.find(d => normalizePath(d.uri.fsPath) === filePath);
+-    if (openDoc && openDoc.getText() === diskContent) {
+-      // User saved in VSCode — accept into baseline, no hunk
+-      this.stateManager.snapshotFile(filePath, diskContent);
 -      return;
 +  private applyClaudeChange(filePath: string, before: string | null, after: string): void {
 +    const basename = path.basename(filePath);
@@ -1142,37 +1200,6 @@ index f1ef23e..e9d7921 100644
 +    this.onStateChanged();
 +  }
  
--    const git = this.stateManager.git;
--    if (!git) return;
-+  /** Map a path reported by Claude Code to this workspace's form of it, or undefined when outside the workspace. */
-+  private toWorkspacePath(p: string): string | undefined {
-+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-+    if (!root) return undefined;
-+    const rootKey = pathKey(root);
-+    const key = pathKey(p);
-+    if (key !== rootKey && !key.startsWith(rootKey.endsWith(path.sep) ? rootKey : rootKey + path.sep)) return undefined;
-+    return normalizePath(path.join(root, path.resolve(p).slice(path.resolve(root).length)));
-+  }
- 
--    // Check if this was a manual save in VSCode (editor buffer matches disk)
--    const openDoc = vscode.workspace.textDocuments.find(d => normalizePath(d.uri.fsPath) === filePath);
--    if (openDoc && openDoc.getText() === diskContent) {
--      // User saved in VSCode — accept into baseline, no hunk
--      this.stateManager.snapshotFile(filePath, diskContent);
--      return;
-+  /** Remove a deleted file or directory (and everything under it) from tracking. */
-+  private removeTree(filePath: string): void {
-+    this.stateManager.removeFile(filePath);
-+    this.forget(filePath);
-+    const prefix = filePath + path.sep;
-+    for (const child of Array.from(this.stateManager.getAllFiles().keys())) {
-+      if (child.startsWith(prefix)) {
-+        this.stateManager.removeFile(child);
-+        this.forget(child);
-+      }
-     }
-+  }
- 
 -    // External change — compare against hunkwise baseline
 -    const gitBaseline = await git.getBaseline(filePath);
 -    if (gitBaseline === undefined) {
@@ -1186,16 +1213,38 @@ index f1ef23e..e9d7921 100644
 -      // behavior which also silently snapshots.
 -      this.stateManager.snapshotFile(filePath, diskContent);
 -      return;
--    }
++  /** Map a path reported by Claude Code to this workspace's form of it, or undefined when outside the workspace. */
++  private toWorkspacePath(p: string): string | undefined {
++    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
++    if (!root) return undefined;
++    const rootKey = pathKey(root);
++    const key = pathKey(p);
++    if (key !== rootKey && !key.startsWith(rootKey.endsWith(path.sep) ? rootKey : rootKey + path.sep)) return undefined;
++    return normalizePath(path.join(root, path.resolve(p).slice(path.resolve(root).length)));
++  }
++
++  /** Remove a deleted file or directory (and everything under it) from tracking. */
++  private removeTree(filePath: string): void {
++    this.stateManager.removeFile(filePath);
++    this.forget(filePath);
++    const prefix = filePath + path.sep;
++    for (const child of Array.from(this.stateManager.getAllFiles().keys())) {
++      if (child.startsWith(prefix)) {
++        this.stateManager.removeFile(child);
++        this.forget(child);
++      }
+     }
 -    this.enterReviewing(filePath, gitBaseline, diskContent);
-+  private forget(filePath: string): void {
-+    this.knownContent.delete(filePath);
-+    this.unpersisted.delete(filePath);
-+    this.scheduleSaveKnown();
    }
  
 -  private onDocumentChange(e: vscode.TextDocumentChangeEvent): void {
 -    if (this._suppressed) return;
++  private forget(filePath: string): void {
++    this.knownContent.delete(filePath);
++    this.unpersisted.delete(filePath);
++    this.scheduleSaveKnown();
++  }
++
 +  /** Save a baseline that was only updated in memory (for unsaved edits) to git. */
 +  private persistBaseline(filePath: string): void {
 +    if (!this.unpersisted.delete(filePath)) return;
@@ -1276,6 +1325,7 @@ index f1ef23e..e9d7921 100644
 -      if (baseline === null && current === '') {
 -        this.onStateChanged();
 -        return;
++  /** Read the saved review state. Content already known in memory is newer, so it is kept. */
 +  private loadKnown(): void {
 +    this.knownLoaded = true;
 +    const file = this.knownPath;
@@ -1283,7 +1333,7 @@ index f1ef23e..e9d7921 100644
 +    try {
 +      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
 +      for (const [filePath, content] of Object.entries(data?.files ?? {})) {
-+        if (typeof content === 'string') this.knownContent.set(filePath, content);
++        if (typeof content === 'string' && !this.knownContent.has(filePath)) this.knownContent.set(filePath, content);
        }
 -      this.stateManager.exitReviewing(filePath);
 +    } catch { /* nothing saved yet */ }
@@ -1306,7 +1356,10 @@ index f1ef23e..e9d7921 100644
 +
 +  private saveKnown(): void {
 +    const file = this.knownPath;
-+    if (!file || !this.knownLoaded || !this.stateManager.enabled || !fs.existsSync(path.dirname(file))) return;
++    if (!file || !this.stateManager.enabled || !fs.existsSync(path.dirname(file))) return;
++    // Nothing was loaded at startup when hunkwise was enabled later on (e.g. auto-enable in a
++    // new folder). Load now, so that saving never drops what an earlier session saved.
++    if (!this.knownLoaded) this.loadKnown();
 +    const files: Record<string, string> = {};
 +    for (const [filePath, content] of this.knownContent) {
 +      if (this.stateManager.getFile(filePath)?.status === 'reviewing') files[filePath] = content;
@@ -1321,7 +1374,7 @@ index f1ef23e..e9d7921 100644
    }
  
    dispose(): void {
-@@ -510,8 +602,17 @@ export class FileWatcher {
+@@ -510,8 +644,17 @@ export class FileWatcher {
        clearTimeout(timer);
      }
      this.debounceTimers.clear();
@@ -1413,7 +1466,7 @@ index 8e0ff05..17c445d 100644
        return await this.git(['show', `:${rel}`]);
      } catch {
 diff --git a/src/reviewPanel.ts b/src/reviewPanel.ts
-index 92e57f6..cf12619 100644
+index 92e57f6..b941a62 100644
 --- a/src/reviewPanel.ts
 +++ b/src/reviewPanel.ts
 @@ -52,6 +52,7 @@ interface PanelHunk {
@@ -1446,6 +1499,17 @@ index 92e57f6..cf12619 100644
    setLoading(loading: boolean): void {
      this._loading = loading;
      if (!this.view) return;
+@@ -123,7 +134,9 @@ export class ReviewPanel implements vscode.WebviewViewProvider {
+       if (!fileExists) {
+         currentContent = '';
+       } else {
+-        const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
++        // Unsaved edits only exist in the editor. Otherwise the disk is leading: an open document
++        // can be outdated when the file watcher missed a change (e.g. in some dev containers).
++        const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath && d.isDirty);
+         currentContent = doc ? doc.getText() : '';
+         if (!doc) {
+           try { currentContent = fs.readFileSync(filePath, 'utf-8'); } catch { currentContent = ''; }
 diff --git a/src/stateManager.ts b/src/stateManager.ts
 index 505450d..26dd60b 100644
 --- a/src/stateManager.ts
