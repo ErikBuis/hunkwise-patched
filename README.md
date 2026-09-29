@@ -6,13 +6,14 @@ Claude Code (unlike Copilot or Cursor) doesn't come with a way to accept or disc
 This build flips that around, so hunkwise only shows the changes it knows Claude made. Claude Code tells it exactly which file it is about to edit and what the file looked like before and after (through Claude Code hooks), and everything else is accepted silently. On top of that, this build turns itself on in every folder you open, keeps its data in VS Code's own storage (so no `.vscode/hunkwise` folders show up in your projects), and also tracks files in subfolders on Windows (which the original version didn't).
 
 ## Installation
+
 ### Windows
-1. Unzip this folder anywhere.
+1. Clone this repo anywhere.
 2. Double-click `install.cmd`.
 3. Fully quit VS Code (all windows, not just the one you're in) and reopen it.
 
 ### Linux and macOS
-1. Unzip this folder anywhere.
+1. Clone this repo anywhere.
 2. Run `bash install.sh` from it (it needs `python3` to edit the JSON config files).
 3. Fully quit VS Code (all windows, not just the one you're in) and reopen it.
 
@@ -24,7 +25,13 @@ After that, your container may already have everything. VS Code can be set up to
 ## What shows up as a hunk
 Only changes Claude makes with its file tools: `Edit`, `Write` (including new files) and `NotebookEdit`.
 
-Everything else, like your own typing or a discard in Source Control, is accepted without a hunk. If you change a file that still has Claude hunks in it, the Claude hunks your change overlaps disappear (since you clearly already dealt with those), and the rest stay where they are.
+Everything else, like your own typing, a Black formatting run, or a Git discard, is accepted without a hunk. The one exception is when you edit lines inside a Claude hunk: your edit then becomes part of that hunk (as if Claude wrote it), and the hunk stays until you accept or discard it.
+
+## Reviewing
+- Every hunk has its **Accept** and **Discard** buttons in the top right, right above it. After you click one, the editor scrolls to the next hunk and puts its buttons in exactly the same spot, so you can click through a file without moving your mouse.
+- Removed lines are shown in red above the hunk, and wrap just like the rest of the editor does.
+- The status bar (bottom right) and the editor title bar have **Accept All** and **Discard All** buttons for the file you're looking at, plus arrows to jump to the previous or next hunk. The status bar also tells you which hunk you're at (e.g. "2 of 5").
+- Files with hunks to review get a ✦ badge and an orange color in the Explorer (their folders do too), so you can see what Claude changed without opening the hunkwise panel.
 
 ## Known limitations
 - Files Claude changes through Bash (`sed`, scripts, git) are not shown, including deleted files. Claude Code has no delete tool, and I couldn't find a way to attribute Bash changes to Claude without also catching things you did yourself at the same moment. I'd rather miss those than show false positives.
@@ -32,8 +39,8 @@ Everything else, like your own typing or a discard in Source Control, is accepte
 - In a dev container that works on a folder from your Windows drive (the default when you open a local folder in a container), Linux never gets notified when a file changes. VS Code itself has the same problem, so a file that's already open can keep showing its old content until you click it. hunkwise makes up for it by comparing the files it's reviewing with the disk every 2 seconds, and its panel always reads from disk, so Claude's changes still show up there right away. If you want to get rid of the problem entirely, keep the repo inside WSL or in a container volume (**Dev Containers: Clone Repository in Container Volume**), which also makes the container a lot faster.
 - Only files inside the folder you have open in VS Code are tracked. If Claude edits a file somewhere else on your PC (e.g. a config file in your home folder), hunkwise ignores it. This is baked into how hunkwise works: it stores its baselines in a small git repo tied to your workspace folder (and git can't track files outside it), and it only watches that folder for changes. Fixing this would mean a separate storage and file watcher for outside files, plus deciding which VS Code window should show them when you have several open, so I left it out for now.
 
-## Claude Code hooks
-To know what Claude edits, hunkwise runs a tiny local server on `127.0.0.1:47821` and Claude Code calls it right before and after every Edit/Write/NotebookEdit. The install script registers these hooks in `~/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json` on Windows), and your other settings and hooks stay untouched. If VS Code isn't running, the hooks just find nothing listening and Claude Code carries on normally.
+## How it works (for nerds)
+To know what Claude edits, hunkwise runs a tiny local server on `127.0.0.1:47821` and Claude Code calls it right before and after every Edit/Write/NotebookEdit. The install script registers these hooks in `~/.claude/settings.json`, and your other settings and hooks stay untouched. If VS Code isn't running, the hooks just find nothing listening and Claude Code carries on normally.
 
 ## Turning it off
 To turn it off for one folder, go to the hunkwise panel > gear icon > **Disable**. It stays off in that folder until you click **Enable** again.

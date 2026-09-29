@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index dc122e2..1e64327 100644
+index dc122e2..24c4bf7 100644
 --- a/README.md
 +++ b/README.md
 @@ -18,11 +18,11 @@ AI coding tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-cod
@@ -42,7 +42,7 @@ index dc122e2..1e64327 100644
  
 -- **External changes** (AI tools, scripts): Detected when the file content on disk differs from the open editor buffer. These trigger review mode with inline hunks.
 -- **Manual edits** (user typing in VSCode): The editor buffer matches the disk content after save. These silently update the baseline — no hunks shown.
-+Every other change (typing, saving, Source Control discards, stash or checkout, formatters, other tools) silently updates the baseline. If such a change touches a file that still has Claude hunks, only the Claude hunks it overlaps are dropped (you dealt with them); the rest stay, and your change itself never shows up as a hunk.
++Every other change (typing, saving, Source Control discards, stash or checkout, formatters, other tools) silently updates the baseline. If such a change edits lines inside a Claude hunk, it becomes part of that hunk, which stays until you accept or discard it. Changes elsewhere never show up as a hunk.
  
 -This means you can freely edit files while hunkwise is enabled, and only tool-generated changes will produce hunks.
 +Only one VSCode window can listen on the port. It writes each hook event to a shared folder in the temp directory, which every window follows, and another window takes over when it closes. Changes Claude makes while no VSCode window is open are not tracked.
@@ -56,6 +56,112 @@ index dc122e2..1e64327 100644
  
  ### Ignore rules
  
+diff --git a/package.json b/package.json
+index 8ae8760..b52c335 100644
+--- a/package.json
++++ b/package.json
+@@ -42,6 +42,26 @@
+         "command": "hunkwise.refresh",
+         "title": "hunkwise: Refresh State",
+         "icon": "$(refresh)"
++      },
++      {
++        "command": "hunkwise.previousHunk",
++        "title": "hunkwise: Previous Claude Change",
++        "icon": "$(arrow-up)"
++      },
++      {
++        "command": "hunkwise.nextHunk",
++        "title": "hunkwise: Next Claude Change",
++        "icon": "$(arrow-down)"
++      },
++      {
++        "command": "hunkwise.acceptAllInFile",
++        "title": "hunkwise: Accept All Claude Changes in File",
++        "icon": "$(check-all)"
++      },
++      {
++        "command": "hunkwise.discardAllInFile",
++        "title": "hunkwise: Discard All Claude Changes in File",
++        "icon": "$(discard)"
+       }
+     ],
+     "menus": {
+@@ -56,6 +76,46 @@
+           "when": "view == hunkwiseToolbar",
+           "group": "navigation"
+         }
++      ],
++      "editor/title": [
++        {
++          "command": "hunkwise.previousHunk",
++          "when": "hunkwise.activeEditorHasHunks && !isInDiffEditor",
++          "group": "navigation@1"
++        },
++        {
++          "command": "hunkwise.nextHunk",
++          "when": "hunkwise.activeEditorHasHunks && !isInDiffEditor",
++          "group": "navigation@2"
++        },
++        {
++          "command": "hunkwise.acceptAllInFile",
++          "when": "hunkwise.activeEditorHasHunks && !isInDiffEditor",
++          "group": "navigation@3"
++        },
++        {
++          "command": "hunkwise.discardAllInFile",
++          "when": "hunkwise.activeEditorHasHunks && !isInDiffEditor",
++          "group": "navigation@4"
++        }
++      ],
++      "commandPalette": [
++        {
++          "command": "hunkwise.previousHunk",
++          "when": "hunkwise.activeEditorHasHunks"
++        },
++        {
++          "command": "hunkwise.nextHunk",
++          "when": "hunkwise.activeEditorHasHunks"
++        },
++        {
++          "command": "hunkwise.acceptAllInFile",
++          "when": "hunkwise.activeEditorHasHunks"
++        },
++        {
++          "command": "hunkwise.discardAllInFile",
++          "when": "hunkwise.activeEditorHasHunks"
++        }
+       ]
+     },
+     "viewsContainers": {
+@@ -75,7 +135,19 @@
+           "type": "webview"
+         }
+       ]
+-    }
++    },
++    "colors": [
++      {
++        "id": "hunkwise.claudeChangeForeground",
++        "description": "Color of files in the Explorer that have Claude changes to review.",
++        "defaults": {
++          "dark": "#E8956F",
++          "light": "#B8532C",
++          "highContrast": "#F2A882",
++          "highContrastLight": "#9A3F1C"
++        }
++      }
++    ]
+   },
+   "scripts": {
+     "vscode:prepublish": "npm run compile",
+@@ -97,4 +169,4 @@
+     "diff": "^5.2.0",
+     "ignore": "^7.0.5"
+   }
+-}
+\ No newline at end of file
++}
 diff --git a/src/claudeHooks.ts b/src/claudeHooks.ts
 new file mode 100644
 index 0000000..a11c6a4
@@ -362,20 +468,21 @@ index 0000000..a11c6a4
 +  }
 +}
 diff --git a/src/commands.ts b/src/commands.ts
-index 0a92f8b..da11991 100644
+index 0a92f8b..b38d916 100644
 --- a/src/commands.ts
 +++ b/src/commands.ts
-@@ -8,6 +8,9 @@ import { computeHunks, hunkId } from './diffEngine';
+@@ -7,6 +7,10 @@ import { ReviewPanel } from './reviewPanel';
+ import { computeHunks, hunkId } from './diffEngine';
  import { upsertGitignore } from './gitignoreManager';
  import { log } from './log';
- 
++import { revealHunk } from './reviewUi';
++
 +/** workspaceState key: set when the user explicitly disabled hunkwise in this workspace. */
 +export const AUTO_ENABLE_OPT_OUT_KEY = 'hunkwise.autoEnableOptOut';
-+
+ 
  export function registerCommands(
    context: vscode.ExtensionContext,
-   stateManager: StateManager,
-@@ -16,12 +19,15 @@ export function registerCommands(
+@@ -16,12 +20,15 @@ export function registerCommands(
    onStateChanged: () => void
  ): void {
    context.subscriptions.push(
@@ -397,7 +504,7 @@ index 0a92f8b..da11991 100644
      vscode.commands.registerCommand('hunkwise.setIgnorePatterns', async (patterns: string[]) => {
        stateManager.setIgnorePatterns(patterns);
        onStateChanged();
-@@ -59,7 +65,9 @@ async function enableHunkwise(
+@@ -59,7 +66,9 @@ async function enableHunkwise(
        new Promise(resolve => setTimeout(resolve, 750)),
        (async () => {
          await stateManager.setEnabled(true);
@@ -408,16 +515,156 @@ index 0a92f8b..da11991 100644
          await stateManager.snapshotWorkspace((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
        })(),
      ]);
+@@ -219,9 +228,10 @@ export function acceptHunk(
+     stateManager.exitReviewing(filePath, doc.getText());
+   } else {
+     stateManager.setFile(filePath, { status: 'reviewing', baseline: newBaseline });
+-    revealNextHunk(filePath, remainingHunks, originalNewStart);
+   }
+   onStateChanged();
++  // After the redraw, so the scroll position accounts for the insets that were just removed.
++  revealNextHunk(filePath, remainingHunks, originalNewStart);
+   log(`acceptHunk(${basename}): done`);
+ }
+ 
+@@ -234,9 +244,7 @@ function revealNextHunk(filePath: string, remainingHunks: ReturnType<typeof comp
+   const next = remainingHunks.find(h => h.newStart >= originalNewStart) ?? remainingHunks[0];
+   if (!next) return;
+ 
+-  const pos = new vscode.Position(Math.max(0, next.newStart - 1), 0);
+-  editor.selection = new vscode.Selection(pos, pos);
+-  editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
++  revealHunk(editor, next);
+ }
+ 
+ export async function discardHunk(
+@@ -305,10 +313,10 @@ export async function discardHunk(
+       }
+       log(`discardHunk(${basename}): no hunks left, exitReviewing`);
+       stateManager.exitReviewing(filePath);
+-    } else {
+-      revealNextHunk(filePath, remainingHunks, originalNewStart);
+     }
+     onStateChanged();
++    // After the redraw, so the scroll position accounts for the insets that were just removed.
++    revealNextHunk(filePath, remainingHunks, originalNewStart);
+     log(`discardHunk(${basename}): done`);
+   } finally {
+     fileWatcher.clearSelfEdit(filePath);
 diff --git a/src/decorationManager.ts b/src/decorationManager.ts
-index e652a63..2f77b51 100644
+index e652a63..05e160d 100644
 --- a/src/decorationManager.ts
 +++ b/src/decorationManager.ts
-@@ -94,9 +94,15 @@ interface HunkInset {
+@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
+ import { StateManager } from './stateManager';
+ import { computeHunks, hunkId } from './diffEngine';
+ import { log } from './log';
++import { buildHunkHtml, WrapMode } from './hunkInsetHtml';
+ 
+ // ── Added lines ──────────────────────────────────────────────────────────────
+ const addedLineDecoration = vscode.window.createTextEditorDecorationType({
+@@ -9,83 +10,16 @@ const addedLineDecoration = vscode.window.createTextEditorDecorationType({
+   isWholeLine: true,
+ });
+ 
+-// ── HTML helpers ─────────────────────────────────────────────────────────────
+-function escapeHtml(s: string): string {
+-  return s
+-    .replace(/&/g, '&amp;')
+-    .replace(/</g, '&lt;')
+-    .replace(/>/g, '&gt;')
+-    .replace(/"/g, '&quot;');
+-}
+-
+-// ── Deleted-lines inset ───────────────────────────────────────────────────────
+-function buildDeletedHtml(lines: string[], tabSize: number): string {
+-  const rows = lines.map(l => `<div class="line">${escapeHtml(l)}</div>`).join('');
+-  return `<!DOCTYPE html><html style="background:var(--vscode-diffEditor-removedLineBackground,rgba(255,0,0,0.1))"><head>
+-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+-<style>
+-* { box-sizing: border-box; margin: 0; padding: 0; }
+-html, body { height: 100%; overflow: hidden; }
+-body {
+-  background: var(--vscode-diffEditor-removedLineBackground, rgba(255,0,0,0.1));
+-  color: var(--vscode-editor-foreground);
+-  font-family: var(--vscode-editor-font-family, monospace);
+-  font-size: var(--vscode-editor-font-size, 13px);
+-  line-height: var(--vscode-editor-line-height, 1.5);
+-}
+-.line { white-space: pre; overflow: hidden; text-overflow: ellipsis; tab-size: ${tabSize}; }
+-</style>
+-</head><body>${rows}</body></html>`;
+-}
+-
+-// ── Action-bar inset ──────────────────────────────────────────────────────────
+-function buildActionsHtml(filePath: string, hunkId: string): string {
+-  return `<!DOCTYPE html><html><head>
+-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+-<style>
+-* { box-sizing: border-box; margin: 0; padding: 0; }
+-html, body { height: 100%; overflow: visible; }
+-body { background: transparent; position: relative; }
+-.bar {
+-  position: absolute;
+-  top: 3px; left: 4px;
+-  display: flex; align-items: center; gap: 4px;
+-}
+-button {
+-  background: var(--vscode-button-secondaryBackground, #3a3d41);
+-  color: var(--vscode-button-secondaryForeground, #cccccc);
+-  border: 1px solid var(--vscode-button-border, rgba(128,128,128,0.4));
+-  border-radius: 2px;
+-  padding: 0 6px; font-size: 10px;
+-  font-family: var(--vscode-font-family, sans-serif);
+-  cursor: pointer; height: 20px; line-height: 1;
+-  display: inline-flex; align-items: center; white-space: nowrap;
+-}
+-button:hover { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
+-.btn-accept {
+-  background: #2a7d3a;
+-  color: #d4f0da;
+-  border-color: rgba(63,185,80,0.3);
+-}
+-.btn-accept:hover { background: #256b31; }
+-.btn-discard {
+-  background: rgba(248,81,73,0.08);
+-  color: #c97d7a;
+-  border-color: rgba(248,81,73,0.25);
+-}
+-.btn-discard:hover { background: rgba(248,81,73,0.15); }
+-</style>
+-</head><body>
+-<div class="bar">
+-<button class="btn-accept" onclick="accept()">✓ Accept</button>
+-<button class="btn-discard" onclick="discard()">↺ Discard</button>
+-</div>
+-<script>
+-const vscode = acquireVsCodeApi();
+-function accept() { vscode.postMessage({ command: 'accept', filePath: ${JSON.stringify(filePath)}, hunkId: ${JSON.stringify(hunkId)} }); }
+-function discard() { vscode.postMessage({ command: 'discard', filePath: ${JSON.stringify(filePath)}, hunkId: ${JSON.stringify(hunkId)} }); }
+-</script>
+-</body></html>`;
++function wrapModeFor(editor: vscode.TextEditor): WrapMode {
++  const config = vscode.workspace.getConfiguration('editor', editor.document);
++  const column = config.get<number>('wordWrapColumn', 80);
++  switch (config.get<string>('wordWrap', 'off')) {
++    case 'on': return { kind: 'width' };
++    case 'wordWrapColumn': return { kind: 'column', column };
++    // Wraps at the column or the editor width, whichever comes first.
++    case 'bounded': return { kind: 'column', column };
++    default: return { kind: 'off' };
++  }
+ }
+ 
+ interface HunkInset {
+@@ -94,9 +28,17 @@ interface HunkInset {
    disposeListener: vscode.Disposable;
    // Cache key: used to detect whether this inset can be reused
    cacheKey: string;
 +  // Assigning webview.html reloads the webview, so only do it when the content changed.
 +  html: string;
++  // Key under which the hunk's measured height is remembered (see measuredHeights).
++  measureKey: string;
    disposed: boolean;
  }
  
@@ -428,15 +675,24 @@ index e652a63..2f77b51 100644
  function insetCacheKey(afterLine: number, height: number): string {
    return `${afterLine}:${height}`;
  }
-@@ -104,6 +110,7 @@ function insetCacheKey(afterLine: number, height: number): string {
+@@ -104,11 +46,14 @@ function insetCacheKey(afterLine: number, height: number): string {
  export class DecorationManager {
    // editorKey → ordered list of insets for that editor
    private insets: Map<string, HunkInset[]> = new Map();
+-  private onAction: ((command: 'accept' | 'discard', filePath: string, hunkId: string) => void) | undefined;
 +  private insetTimers: Map<string, NodeJS.Timeout> = new Map();
-   private onAction: ((command: 'accept' | 'discard', filePath: string, hunkId: string) => void) | undefined;
++  // Height in lines that a hunk's inset reported it needs, by editor, wrap settings and content.
++  private measuredHeights: Map<string, number> = new Map();
++  private onAction: ((command: 'accept' | 'discard', filePath: string, hunkId: string, editorKey: string) => void) | undefined;
  
    constructor(
-@@ -121,6 +128,35 @@ export class DecorationManager {
+     private stateManager: StateManager,
+-    onAction?: (command: 'accept' | 'discard', filePath: string, hunkId: string) => void,
++    onAction?: (command: 'accept' | 'discard', filePath: string, hunkId: string, editorKey: string) => void,
+   ) {
+     this.onAction = onAction;
+   }
+@@ -121,6 +66,35 @@ export class DecorationManager {
      }
    }
  
@@ -472,7 +728,7 @@ index e652a63..2f77b51 100644
    refreshActionBar(_editor: vscode.TextEditor): void { /* buttons live in insets */ }
  
    private disposeInsetList(list: HunkInset[]): void {
-@@ -150,6 +186,11 @@ export class DecorationManager {
+@@ -150,6 +124,11 @@ export class DecorationManager {
      const filePath = editor.document.uri.fsPath;
      const editorKey = editor.document.uri.toString();
      const fileState = this.stateManager.getFile(filePath);
@@ -484,7 +740,112 @@ index e652a63..2f77b51 100644
  
      // Skip insets: in diff editors (viewColumn undefined), or when user disabled inline decorations
      const isInDiff = editor.viewColumn === undefined && diffPaths.has(filePath);
-@@ -253,8 +294,11 @@ export class DecorationManager {
+@@ -164,6 +143,7 @@ export class DecorationManager {
+ 
+     const addedRanges: vscode.Range[] = [];
+     const tabSize = editor.options.tabSize as number || 4;
++    const wrap = wrapModeFor(editor);
+     const parsed = computeHunks(fileState.baseline, editor.document.getText());
+ 
+     // Build the desired inset specs first
+@@ -171,13 +151,11 @@ export class DecorationManager {
+       afterLine: number;
+       height: number;
+       html: string;
++      measureKey: string;
+     }
+     const specs: InsetSpec[] = [];
+ 
+     for (const hunk of parsed) {
+-      const id = hunkId(hunk);
+-
+-
+       for (let i = 0; i < hunk.newLines; i++) {
+         const lineIdx = hunk.newStart - 1 + i;
+         if (lineIdx < editor.document.lineCount) {
+@@ -185,65 +163,26 @@ export class DecorationManager {
+         }
+       }
+ 
+-      // ── Inset placement strategy ──
+-      //
+-      // Layout order (top → bottom):
+-      //   [deleted inset]   red lines showing removed content
+-      //   [green lines]     added lines in the actual document
+-      //   [action bar]      Accept / Discard buttons
+-      //
+-      // ── afterLine semantics ──
+-      // createWebviewTextEditorInset takes a 0-based line number.
+-      // Internally VSCode does +1 before storing as afterLineNumber (1-based).
+-      // afterLineNumber=0 means "above line 1" (file top).
+-      // So to place an inset above line 1 we must pass afterLine = -1.
+-      //
+-      // Normal case (newLines > 0):
+-      //   deleted → afterLine = newStart - 2  (just above the green block)
+-      //   action  → afterLine = newStart + newLines - 2  (just below the green block)
+-      //   Different afterLines, so push order doesn't matter.
+-      //
+-      // Pure deletion (newLines == 0):
+-      //   Both deleted and action use afterLine = newStart - 2 (same value).
+-      //   VSCode stacks insets at the same afterLine with the FIRST-pushed on TOP.
+-      //   So we push deleted first, then action, to render deleted above action.
+-
+-      const hasDeletion = hunk.removedContent.length > 0;
+-      const hasAddition = hunk.newLines > 0;
+-
+-      // afterLine for deleted inset: just above the green block (or above its insertion point)
+-      const deletedAfterLine = hunk.newStart - 2; // may be -1 when newStart==1, that's correct
+-
+-      let actionAfterLine: number;
+-      if (hasAddition) {
+-        actionAfterLine = hunk.newStart + hunk.newLines - 2;
+-      } else {
+-        // Pure deletion: no green block. Action bar shares the same afterLine as the
+-        // deleted inset. VSCode stacks insets at the same afterLine with the first-pushed
+-        // on top, so we rely on push order below to place deleted above action.
+-        actionAfterLine = deletedAfterLine;
+-      }
+-
+-      // When multiple insets share the same afterLine, VSCode stacks them so that
+-      // the FIRST pushed inset appears TOPMOST.  For the normal case (deletion above
+-      // green lines, action below), they have different afterLines so push order
+-      // doesn't matter.  For pure deletion (same afterLine), we push deleted first,
+-      // then action, so deleted renders above action.
+-
+-      if (hasDeletion) {
+-        specs.push({
+-          afterLine: Math.max(-1, deletedAfterLine),
+-          height: hunk.removedContent.length,
+-          html: buildDeletedHtml(hunk.removedContent, tabSize),
+-        });
+-      }
++      // createWebviewTextEditorInset() places the inset below the given 0-based line, and -1
++      // means above the first line. So newStart - 2 (newStart is 1-based) puts it right above
++      // the hunk's first line, or, for a pure deletion, right where the lines were removed.
++      const afterLine = Math.max(-1, hunk.newStart - 2);
++      const measureKey = `${editorKey}|${JSON.stringify(wrap)}|${tabSize}|${hunk.removedContent.join('\n')}`;
++      const height = this.measuredHeights.get(measureKey) ?? 1 + hunk.removedContent.length;
+       specs.push({
+-        afterLine: actionAfterLine,
+-        height: 2,
+-        html: buildActionsHtml(filePath, id),
++        afterLine,
++        height,
++        html: buildHunkHtml(filePath, hunkId(hunk), hunk.removedContent, tabSize, height, wrap),
++        measureKey,
+       });
+     }
+ 
++    // Forget measurements of hunks this editor no longer shows.
++    const inUse = new Set(specs.map(spec => spec.measureKey));
++    for (const key of Array.from(this.measuredHeights.keys())) {
++      if (key.startsWith(editorKey + '|') && !inUse.has(key)) this.measuredHeights.delete(key);
++    }
++
+     // Reuse existing insets when cache keys match to avoid flicker
+     const existing = this.insets.get(editorKey) ?? [];
+     const nextInsets: HunkInset[] = [];
+@@ -253,13 +192,17 @@ export class DecorationManager {
        const key = insetCacheKey(spec.afterLine, spec.height);
        const prev = existing[i];
        if (prev && prev.cacheKey === key && !prev.disposed) {
@@ -495,19 +856,44 @@ index e652a63..2f77b51 100644
 +          prev.inset.webview.html = spec.html;
 +          prev.html = spec.html;
 +        }
++        prev.measureKey = spec.measureKey;
          nextInsets.push(prev);
          existing[i] = undefined as any; // mark as consumed
        } else {
-@@ -300,7 +344,7 @@ export class DecorationManager {
+         // Position changed or inset was disposed by VSCode — recreate
+-        const created = this.makeInset(editorKey, editor, spec.afterLine, spec.height, spec.html, key);
++        const created = this.makeInset(editorKey, editor, spec.afterLine, spec.height, spec.html, key, spec.measureKey);
+         if (created) nextInsets.push(created);
+       }
+     }
+@@ -288,6 +231,7 @@ export class DecorationManager {
+     height: number,
+     html: string,
+     cacheKey: string,
++    measureKey: string,
+   ): HunkInset | undefined {
+     try {
+       const inset = (vscode.window as any).createWebviewTextEditorInset(
+@@ -296,11 +240,16 @@ export class DecorationManager {
+       inset.webview.html = html;
+       const disposable = inset.webview.onDidReceiveMessage((msg: any) => {
+         if (msg.command === 'accept' || msg.command === 'discard') {
+-          this.onAction?.(msg.command, msg.filePath, msg.hunkId);
++          this.onAction?.(msg.command, msg.filePath, msg.hunkId, editorKey);
++        } else if (msg.command === 'resize' && Number.isInteger(msg.lines) && msg.lines > 0 && msg.lines !== height) {
++          // The removed lines wrap onto more (or fewer) lines than estimated: recreate at that height.
++          this.measuredHeights.set(entry.measureKey, msg.lines);
++          const target = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === editorKey);
++          if (target) this.applyToEditor(target, this.diffEditorFilePaths());
          }
        });
        const entry: HunkInset = {
 -        inset, disposable, cacheKey, disposed: false,
-+        inset, disposable, cacheKey, html, disposed: false,
++        inset, disposable, cacheKey, html, measureKey, disposed: false,
          disposeListener: inset.onDidDispose(() => {
            entry.disposed = true;
            // Re-apply if editor is still visible so insets are immediately rebuilt
-@@ -318,6 +362,8 @@ export class DecorationManager {
+@@ -318,6 +267,8 @@ export class DecorationManager {
    }
  
    dispose(): void {
@@ -517,10 +903,10 @@ index e652a63..2f77b51 100644
      for (const list of this.insets.values()) {
        this.disposeInsetList(list);
 diff --git a/src/diffEngine.ts b/src/diffEngine.ts
-index 96e6c36..e538a67 100644
+index 96e6c36..9979964 100644
 --- a/src/diffEngine.ts
 +++ b/src/diffEngine.ts
-@@ -73,3 +73,80 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
+@@ -73,3 +73,81 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
    return hunks;
  }
  
@@ -576,45 +962,47 @@ index 96e6c36..e538a67 100644
 +}
 +
 +/**
-+ * Fold a change that was not made by the AI tool into the review baseline, so that only the
-+ * tool's own changes remain as hunks.
++ * Fold a change that was not made by the AI tool into the review baseline, so that it doesn't
++ * show up as a hunk of its own.
 + *
 + * The file went from before to after. The hunks between baseline and before are the tool's
-+ * pending changes. Pending hunks that the change touches count as handled and are dropped; the
-+ * others are kept. The result is after with every kept hunk reverted to its baseline lines, so
-+ * that computeHunks(result, after) yields exactly the kept hunks. A null baseline means the tool
-+ * created the file.
++ * pending changes. Parts of the change that touch a pending hunk become part of that hunk (it
++ * stays under review until it is accepted or discarded); all other parts are applied to the
++ * baseline, so computeHunks(result, after) yields only the (possibly edited) pending hunks. A
++ * null baseline means the tool created the file, which then stays a new file under review.
 + */
-+export function rebaseBaseline(baseline: string | null, before: string, after: string): string {
-+  const baseTokens = lineTokens(baseline ?? '');
-+  const pending = tokenHunks(baseline ?? '', before);
-+  const changes = tokenHunks(before, after);
-+  const result = lineTokens(after);
++export function rebaseBaseline(baseline: string | null, before: string, after: string): string | null {
++  if (baseline === null) return null;
++  const result = lineTokens(baseline);
++  const pending = tokenHunks(baseline, before);
++  const afterTokens = lineTokens(after);
 +
-+  const kept = pending.filter(p => !changes.some(c => rangesTouch(p.newStart, p.newEnd, c.oldStart, c.oldEnd)));
-+  // Revert from the end so earlier positions in result stay valid.
-+  for (const p of kept.reverse()) {
-+    const shift = changes
-+      .filter(c => c.oldEnd <= p.newStart)
-+      .reduce((sum, c) => sum + (c.newEnd - c.newStart) - (c.oldEnd - c.oldStart), 0);
-+    result.splice(p.newStart + shift, p.newEnd - p.newStart, ...baseTokens.slice(p.oldStart, p.oldEnd));
++  const folded = tokenHunks(before, after).filter(c => !pending.some(p => rangesTouch(p.newStart, p.newEnd, c.oldStart, c.oldEnd)));
++  // Apply from the end so earlier positions in result stay valid. A folded change lies between
++  // pending hunks, where before and baseline match line for line, apart from a shift.
++  for (const c of folded.reverse()) {
++    const shift = pending
++      .filter(p => p.newEnd <= c.oldStart)
++      .reduce((sum, p) => sum + (p.oldEnd - p.oldStart) - (p.newEnd - p.newStart), 0);
++    result.splice(c.oldStart + shift, c.oldEnd - c.oldStart, ...afterTokens.slice(c.newStart, c.newEnd));
 +  }
 +  return result.join('');
 +}
 diff --git a/src/extension.ts b/src/extension.ts
-index d78cdf8..668cf3a 100644
+index d78cdf8..17b3d11 100644
 --- a/src/extension.ts
 +++ b/src/extension.ts
-@@ -5,7 +5,7 @@ import { StateManager } from './stateManager';
+@@ -5,15 +5,17 @@ import { StateManager } from './stateManager';
  import { FileWatcher } from './fileWatcher';
  import { DecorationManager } from './decorationManager';
  import { ReviewPanel } from './reviewPanel';
 -import { registerCommands, acceptHunk, discardHunk } from './commands';
-+import { registerCommands, acceptHunk, discardHunk, AUTO_ENABLE_OPT_OUT_KEY } from './commands';
++import { registerCommands, acceptHunk, discardHunk, acceptFileByPath, discardFileByPath, AUTO_ENABLE_OPT_OUT_KEY } from './commands';
  import { DiffCodeLensProvider } from './diffCodeLens';
++import { ActiveFileControls, ReviewDecorationProvider } from './reviewUi';
  import { initLog, log } from './log';
  
-@@ -13,7 +13,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+ export async function activate(context: vscode.ExtensionContext): Promise<{ getReviewPanel: () => ReviewPanel | undefined; getStateManager: () => StateManager | undefined; getFileWatcher: () => FileWatcher | undefined }> {
    initLog();
    const ext = vscode.extensions.getExtension('molon.hunkwise');
    log(`activate v${ext?.packageJSON?.version ?? '?'}`);
@@ -624,7 +1012,24 @@ index d78cdf8..668cf3a 100644
    stateManager.onRollback = () => onStateChanged();
  
    // Content provider for showing baselines in diff view
-@@ -96,6 +97,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -33,12 +35,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+   let decorationManager: DecorationManager | undefined;
+   let reviewPanel: ReviewPanel | undefined;
+   let diffCodeLensProvider: DiffCodeLensProvider | undefined;
++  let explorerDecorations: ReviewDecorationProvider | undefined;
++  let activeFileControls: ActiveFileControls | undefined;
+ 
+   // Original state-changed callback — no diff-editor side effects
+   function onStateChanged(): void {
+     decorationManager?.refresh();
+     reviewPanel?.refresh();
+     diffCodeLensProvider?.fire();
++    explorerDecorations?.refresh();
++    activeFileControls?.refresh();
+   }
+ 
+   /** Notify the diff editor that a specific file's baseline changed (only after accept). */
+@@ -96,6 +102,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
    try {
      await stateManager.load((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
      log(`loaded state: enabled=${stateManager.enabled}, files=${stateManager.getAllFiles().size}`);
@@ -632,7 +1037,7 @@ index d78cdf8..668cf3a 100644
    } finally {
      fileWatcher.resumeAll();
    }
-@@ -119,11 +121,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -119,11 +126,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
      }),
      vscode.workspace.onDidChangeTextDocument(e => {
        if (e.document.uri.scheme !== 'file') return;
@@ -647,7 +1052,27 @@ index d78cdf8..668cf3a 100644
      }),
    );
  
-@@ -156,6 +159,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -134,6 +142,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+ 
+   registerCommands(context, stateManager, fileWatcher, reviewPanel, onStateChanged);
+ 
++  // ── Explorer badges and per-file controls ────────────────────────────────────
++  explorerDecorations = new ReviewDecorationProvider(stateManager);
++  activeFileControls = new ActiveFileControls(
++    stateManager,
++    filePath => acceptFileByPath(stateManager, filePath, () => { onStateChanged(); fireBaselineChange(filePath); void closeStaleTabs().catch(err => log(`closeStaleTabs: ${err}`)); }),
++    filePath => discardFileByPath(stateManager, fileWatcher, filePath, () => { onStateChanged(); void closeStaleTabs().catch(err => log(`closeStaleTabs: ${err}`)); }),
++  );
++  context.subscriptions.push(
++    explorerDecorations,
++    vscode.window.registerFileDecorationProvider(explorerDecorations),
++    activeFileControls,
++  );
++
+   // ── Diff CodeLens ─────────────────────────────────────────────────────────
+   diffCodeLensProvider = new DiffCodeLensProvider(stateManager);
+   context.subscriptions.push(
+@@ -156,6 +177,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
        reviewPanel?.setLoading(true);
        try {
          await stateManager.rebuildState((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
@@ -655,7 +1080,7 @@ index d78cdf8..668cf3a 100644
          onStateChanged();
        } catch (err) {
          log(`refresh: error — ${err}`);
-@@ -183,6 +187,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -183,6 +205,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
        reviewPanel?.setLoading(false);
        onStateChanged();
      });
@@ -670,7 +1095,7 @@ index d78cdf8..668cf3a 100644
      onStateChanged();
    }
 diff --git a/src/fileWatcher.ts b/src/fileWatcher.ts
-index f1ef23e..b5a649c 100644
+index f1ef23e..ca3f830 100644
 --- a/src/fileWatcher.ts
 +++ b/src/fileWatcher.ts
 @@ -5,9 +5,11 @@ import * as path from 'path';
@@ -835,7 +1260,7 @@ index f1ef23e..b5a649c 100644
  
      // The `ignore` library requires a trailing slash to match directory-only
      // patterns (e.g. `.vscode-test/`). Without it, `ignores('.vscode-test')`
-@@ -253,256 +315,328 @@ export class FileWatcher {
+@@ -253,256 +315,329 @@ export class FileWatcher {
      return false;
    }
  
@@ -868,7 +1293,8 @@ index f1ef23e..b5a649c 100644
 +  // Only changes made by Claude Code's file tools (Edit, Write, ...) become hunks. Claude Code
 +  // reports each such tool call through hooks (see claudeHooks.ts), including the file content
 +  // right before and after it. Every other change (your own edits, Source Control actions,
-+  // formatters, other tools) is folded into the baseline, so it never shows up as a hunk.
++  // formatters, other tools) is folded into the baseline, so it never shows up as a hunk, unless
++  // it edits a Claude hunk: then it becomes part of that hunk, which stays until you accept it.
  
 -    const git = this.stateManager.git;
 -    if (!git) { log(`onDiskCreate(${basename}): no git, skip`); return; }
@@ -1001,9 +1427,9 @@ index f1ef23e..b5a649c 100644
 -      log(`onDiskDelete(${basename}): new file (null baseline) deleted, removing fileState`);
 -      this.stateManager.exitReviewing(filePath);
 +  /**
-+   * Fold a change that Claude did not make into the baseline. Files under review keep only the
-+   * Claude hunks that the change did not touch. persist=false keeps the new baseline in memory
-+   * only (for unsaved edits).
++   * Fold a change that Claude did not make into the baseline. Parts of it that edit a Claude hunk
++   * become part of that hunk instead (see rebaseBaseline()). persist=false keeps the new baseline
++   * in memory only (for unsaved edits).
 +   */
 +  private async applyOtherChange(filePath: string, content: string | null, persist: boolean): Promise<void> {
 +    const basename = path.basename(filePath);
@@ -1374,7 +1800,7 @@ index f1ef23e..b5a649c 100644
    }
  
    dispose(): void {
-@@ -510,8 +644,17 @@ export class FileWatcher {
+@@ -510,8 +645,17 @@ export class FileWatcher {
        clearTimeout(timer);
      }
      this.debounceTimers.clear();
@@ -1392,6 +1818,103 @@ index f1ef23e..b5a649c 100644
 +  } catch (err: any) {
 +    return err?.code === 'ENOENT' ? null : undefined;
 +  }
++}
+diff --git a/src/hunkInsetHtml.ts b/src/hunkInsetHtml.ts
+new file mode 100644
+index 0000000..d937ada
+--- /dev/null
++++ b/src/hunkInsetHtml.ts
+@@ -0,0 +1,91 @@
++// HTML of the inset hunkwise shows above each hunk. Kept free of the vscode API so it can be unit tested.
++
++// ── HTML helpers ─────────────────────────────────────────────────────────────
++function escapeHtml(s: string): string {
++  return s
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;');
++}
++
++// ── Hunk inset ────────────────────────────────────────────────────────────────
++//
++// One inset per hunk, right above its first line: a row with the Accept / Discard buttons at the
++// right (always in the same spot, like Copilot's), followed by the removed lines (if any).
++//
++// An inset's height is a whole number of editor lines, set when it is created. The webview
++// derives the editor's line height from its own height, and reports back how many lines it
++// really needs (removed lines can wrap), so the inset is recreated at that height.
++
++/** How the removed lines wrap: not at all, at the editor width, or at a column. */
++export type WrapMode = { kind: 'off' } | { kind: 'width' } | { kind: 'column'; column: number };
++
++export function buildHunkHtml(filePath: string, hunkId: string, removed: string[], tabSize: number, heightLines: number, wrap: WrapMode): string {
++  const rows = removed.map(l => `<div class="line">${escapeHtml(l) || ' '}</div>`).join('');
++  const lineStyle = wrap.kind === 'off'
++    ? 'white-space: pre; overflow: hidden; text-overflow: ellipsis;'
++    : `white-space: pre-wrap; overflow-wrap: anywhere;${wrap.kind === 'column' ? ` max-width: ${wrap.column}ch;` : ''}`;
++  const message = (command: string) => JSON.stringify({ command, filePath, hunkId });
++  return `<!DOCTYPE html><html><head>
++<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
++<style>
++* { box-sizing: border-box; margin: 0; padding: 0; }
++:root { --lh: calc(100vh / ${heightLines}); }
++html, body { height: 100%; overflow: hidden; background: transparent; }
++body {
++  color: var(--vscode-editor-foreground);
++  font-family: var(--vscode-editor-font-family, monospace);
++  font-size: var(--vscode-editor-font-size, 13px);
++  font-weight: var(--vscode-editor-font-weight, normal);
++  line-height: var(--lh);
++}
++.bar {
++  height: var(--lh);
++  display: flex; align-items: center; justify-content: flex-end; gap: 4px;
++  /* Keep clear of the editor's vertical scrollbar. */
++  padding-right: 18px;
++}
++.removed { background: var(--vscode-diffEditor-removedLineBackground, rgba(255,0,0,0.1)); }
++.line { ${lineStyle} tab-size: ${tabSize}; }
++button {
++  background: var(--vscode-button-secondaryBackground, #3a3d41);
++  color: var(--vscode-button-secondaryForeground, #cccccc);
++  border: 1px solid var(--vscode-button-border, rgba(128,128,128,0.4));
++  border-radius: 3px;
++  padding: 0 6px; font-size: 11px;
++  font-family: var(--vscode-font-family, sans-serif);
++  cursor: pointer; height: min(20px, calc(var(--lh) - 2px)); line-height: 1;
++  display: inline-flex; align-items: center; white-space: nowrap;
++}
++button:hover { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
++.btn-accept {
++  background: var(--vscode-button-background, #2a7d3a);
++  color: var(--vscode-button-foreground, #ffffff);
++  border-color: transparent;
++}
++.btn-accept:hover { background: var(--vscode-button-hoverBackground, #256b31); }
++</style>
++</head><body>
++<div id="content">
++<div class="bar">
++<button class="btn-accept" title="Accept this change" onclick="send(${escapeHtml(message('accept'))})">✓ Accept</button>
++<button class="btn-discard" title="Discard this change" onclick="send(${escapeHtml(message('discard'))})">↺ Discard</button>
++</div>
++${rows ? `<div class="removed">${rows}</div>` : ''}
++</div>
++<script>
++const vscode = acquireVsCodeApi();
++const HEIGHT_LINES = ${heightLines};
++function send(msg) { vscode.postMessage(msg); }
++function measure() {
++  const lineHeight = window.innerHeight / HEIGHT_LINES;
++  if (!lineHeight) return;
++  const needed = Math.max(1, Math.round(document.getElementById('content').offsetHeight / lineHeight));
++  if (needed !== HEIGHT_LINES) send({ command: 'resize', lines: needed });
++}
++window.addEventListener('resize', measure);
++measure();
++</script>
++</body></html>`;
 +}
 diff --git a/src/hunkwiseGit.ts b/src/hunkwiseGit.ts
 index 8e0ff05..17c445d 100644
@@ -1510,6 +2033,172 @@ index 92e57f6..b941a62 100644
          currentContent = doc ? doc.getText() : '';
          if (!doc) {
            try { currentContent = fs.readFileSync(filePath, 'utf-8'); } catch { currentContent = ''; }
+diff --git a/src/reviewUi.ts b/src/reviewUi.ts
+new file mode 100644
+index 0000000..0284b6d
+--- /dev/null
++++ b/src/reviewUi.ts
+@@ -0,0 +1,160 @@
++import * as vscode from 'vscode';
++import { StateManager } from './stateManager';
++import { computeHunks, ParsedHunk } from './diffEngine';
++import { normalizePath } from './pathNormalize';
++
++/** Context key that tells menus whether the active editor has hunks to review. */
++const HAS_HUNKS_CONTEXT = 'hunkwise.activeEditorHasHunks';
++
++/** The hunks of a file under review, as they are in the given document right now. */
++export function hunksOf(stateManager: StateManager, document: vscode.TextDocument): ParsedHunk[] {
++  if (document.uri.scheme !== 'file') return [];
++  const state = stateManager.getFile(normalizePath(document.uri.fsPath));
++  if (state?.status !== 'reviewing') return [];
++  return computeHunks(state.baseline, document.getText());
++}
++
++/**
++ * Scroll a hunk into view so that its Accept / Discard buttons always end up at the same spot:
++ * right below the middle of the editor. That way you can click through a file's hunks without
++ * moving the mouse.
++ */
++export function revealHunk(editor: vscode.TextEditor, hunk: ParsedHunk): void {
++  const first = Math.max(0, hunk.newStart - 1);
++  editor.selection = new vscode.Selection(first, 0, first, 0);
++  // The buttons sit right below the line before the hunk, so center that line.
++  const anchor = Math.max(0, hunk.newStart - 2);
++  editor.revealRange(new vscode.Range(anchor, 0, anchor, 0), vscode.TextEditorRevealType.InCenter);
++}
++
++/** Colors and badges the files (and their folders) in the Explorer that have Claude changes to review. */
++export class ReviewDecorationProvider implements vscode.FileDecorationProvider, vscode.Disposable {
++  private readonly emitter = new vscode.EventEmitter<vscode.Uri[]>();
++  readonly onDidChangeFileDecorations = this.emitter.event;
++  private decorated: Set<string> = new Set();
++
++  constructor(private readonly stateManager: StateManager) {}
++
++  provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
++    if (uri.scheme !== 'file') return undefined;
++    const state = this.stateManager.getFile(normalizePath(uri.fsPath));
++    if (state?.status !== 'reviewing') return undefined;
++    const decoration = new vscode.FileDecoration(
++      '✦',
++      state.baseline === null ? 'Created by Claude, not reviewed yet' : 'Changed by Claude, not reviewed yet',
++      new vscode.ThemeColor('hunkwise.claudeChangeForeground'),
++    );
++    decoration.propagate = true;
++    return decoration;
++  }
++
++  /** Update the Explorer after files entered or left review. */
++  refresh(): void {
++    const now = new Set<string>();
++    for (const [filePath, state] of this.stateManager.getAllFiles()) {
++      if (state.status === 'reviewing') now.add(filePath);
++    }
++    const changed = [...now].filter(p => !this.decorated.has(p)).concat([...this.decorated].filter(p => !now.has(p)));
++    this.decorated = now;
++    if (changed.length > 0) this.emitter.fire(changed.map(p => vscode.Uri.file(p)));
++  }
++
++  dispose(): void {
++    this.emitter.dispose();
++  }
++}
++
++/**
++ * Controls for the file in the active editor, like Copilot's: previous / next hunk, "2 of 5",
++ * and Accept All / Discard All, in the status bar (bottom right) and in the editor title bar.
++ */
++export class ActiveFileControls implements vscode.Disposable {
++  private readonly items: vscode.StatusBarItem[];
++  private readonly counter: vscode.StatusBarItem;
++  private readonly disposables: vscode.Disposable[] = [];
++  private timer: NodeJS.Timeout | undefined;
++
++  constructor(
++    private readonly stateManager: StateManager,
++    acceptFile: (filePath: string) => Thenable<void> | void,
++    discardFile: (filePath: string) => Thenable<void> | void,
++  ) {
++    // Right-aligned items with a lower priority are shown further to the right.
++    const item = (priority: number, text: string, tooltip: string, command?: string) => {
++      const created = vscode.window.createStatusBarItem('hunkwise.' + (command ?? 'counter'), vscode.StatusBarAlignment.Right, priority);
++      created.name = 'hunkwise: ' + tooltip;
++      created.text = text;
++      created.tooltip = tooltip;
++      created.command = command;
++      return created;
++    };
++    this.counter = item(-1001, '', 'Claude change in this file');
++    this.items = [
++      item(-1000, '$(chevron-up)', 'Previous Claude change', 'hunkwise.previousHunk'),
++      this.counter,
++      item(-1002, '$(chevron-down)', 'Next Claude change', 'hunkwise.nextHunk'),
++      item(-1003, '$(check-all) Accept All', 'Accept all Claude changes in this file', 'hunkwise.acceptAllInFile'),
++      item(-1004, '$(discard) Discard All', 'Discard all Claude changes in this file', 'hunkwise.discardAllInFile'),
++    ];
++
++    const withActiveFile = (action: (filePath: string) => Thenable<void> | void) => async () => {
++      const editor = vscode.window.activeTextEditor;
++      if (editor && hunksOf(this.stateManager, editor.document).length > 0) {
++        await action(normalizePath(editor.document.uri.fsPath));
++      }
++    };
++    this.disposables.push(
++      ...this.items,
++      vscode.commands.registerCommand('hunkwise.nextHunk', () => this.navigate(1)),
++      vscode.commands.registerCommand('hunkwise.previousHunk', () => this.navigate(-1)),
++      vscode.commands.registerCommand('hunkwise.acceptAllInFile', withActiveFile(acceptFile)),
++      vscode.commands.registerCommand('hunkwise.discardAllInFile', withActiveFile(discardFile)),
++      vscode.window.onDidChangeActiveTextEditor(() => this.refresh()),
++      vscode.window.onDidChangeTextEditorSelection(e => { if (e.textEditor === vscode.window.activeTextEditor) this.refreshSoon(); }),
++      vscode.workspace.onDidChangeTextDocument(e => { if (e.document === vscode.window.activeTextEditor?.document) this.refreshSoon(); }),
++    );
++    this.refresh();
++  }
++
++  /** Move the cursor to the next (direction 1) or previous (-1) hunk, wrapping around. */
++  private navigate(direction: 1 | -1): void {
++    const editor = vscode.window.activeTextEditor;
++    if (!editor) return;
++    const hunks = hunksOf(this.stateManager, editor.document);
++    if (hunks.length === 0) return;
++    const line = editor.selection.active.line;
++    const target = direction === 1
++      ? hunks.find(h => h.newStart - 1 > line) ?? hunks[0]
++      : [...hunks].reverse().find(h => h.newStart - 1 < line) ?? hunks[hunks.length - 1];
++    revealHunk(editor, target);
++  }
++
++  private refreshSoon(): void {
++    if (this.timer) clearTimeout(this.timer);
++    this.timer = setTimeout(() => this.refresh(), 150);
++  }
++
++  refresh(): void {
++    if (this.timer) clearTimeout(this.timer);
++    this.timer = undefined;
++    const editor = vscode.window.activeTextEditor;
++    const hunks = editor ? hunksOf(this.stateManager, editor.document) : [];
++    void vscode.commands.executeCommand('setContext', HAS_HUNKS_CONTEXT, hunks.length > 0);
++    if (!editor || hunks.length === 0) {
++      for (const i of this.items) i.hide();
++      return;
++    }
++    // The current hunk is the one the cursor is in, or else the last one before it.
++    const line = editor.selection.active.line;
++    let current = 0;
++    hunks.forEach((h, i) => { if (h.newStart - 1 <= line) current = i; });
++    const inside = hunks[current].newStart - 1 <= line && line < hunks[current].newStart - 1 + Math.max(1, hunks[current].newLines);
++    this.counter.text = inside ? `${current + 1} of ${hunks.length}` : `${hunks.length} change${hunks.length === 1 ? '' : 's'}`;
++    for (const i of this.items) i.show();
++  }
++
++  dispose(): void {
++    if (this.timer) clearTimeout(this.timer);
++    this.disposables.forEach(d => d.dispose());
++  }
++}
 diff --git a/src/stateManager.ts b/src/stateManager.ts
 index 505450d..26dd60b 100644
 --- a/src/stateManager.ts
@@ -1770,12 +2459,84 @@ index 0000000..360b0b8
 +    assert.deepEqual(done, [{ id: 'toolu_1', filePath: file, before: 'original\n', after: 'changed\n' }]);
 +  });
 +});
+diff --git a/src/test/hunkInsetHtml.test.ts b/src/test/hunkInsetHtml.test.ts
+new file mode 100644
+index 0000000..6a59e89
+--- /dev/null
++++ b/src/test/hunkInsetHtml.test.ts
+@@ -0,0 +1,52 @@
++import { describe, it } from 'node:test';
++import assert from 'node:assert/strict';
++import { buildHunkHtml } from '../hunkInsetHtml';
++
++function unescapeHtml(s: string): string {
++  return s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
++}
++
++/** The JavaScript in each onclick attribute, as the browser would run it. */
++function onclickHandlers(html: string): string[] {
++  return [...html.matchAll(/onclick="([^"]*)"/g)].map(m => unescapeHtml(m[1]));
++}
++
++describe('buildHunkHtml', () => {
++  const filePath = 'C:\\Users\\me\\"quoted" <dir>\\file.ts';
++
++  it('produces a script and click handlers that parse', () => {
++    const html = buildHunkHtml(filePath, '3:1:3:1', ['old line'], 4, 2, { kind: 'width' });
++    const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
++    assert.ok(script);
++    assert.doesNotThrow(() => new Function(script));
++    const handlers = onclickHandlers(html);
++    assert.equal(handlers.length, 2);
++    for (const handler of handlers) assert.doesNotThrow(() => new Function('send', handler));
++  });
++
++  it('sends the file path and hunk id unchanged', () => {
++    const html = buildHunkHtml(filePath, '3:1:3:1', [], 4, 1, { kind: 'off' });
++    const sent: unknown[] = [];
++    for (const handler of onclickHandlers(html)) new Function('send', handler)((msg: unknown) => sent.push(msg));
++    assert.deepEqual(sent, [
++      { command: 'accept', filePath, hunkId: '3:1:3:1' },
++      { command: 'discard', filePath, hunkId: '3:1:3:1' },
++    ]);
++  });
++
++  it('escapes removed lines', () => {
++    const html = buildHunkHtml(filePath, 'id', ['<script>alert(1)</script> & "x"'], 4, 2, { kind: 'off' });
++    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;x&quot;'));
++    assert.equal(html.match(/<script>/g)?.length, 1);
++  });
++
++  it('wraps removed lines only when the editor wraps', () => {
++    assert.match(buildHunkHtml(filePath, 'id', ['x'], 4, 2, { kind: 'off' }), /\.line \{ white-space: pre;/);
++    assert.match(buildHunkHtml(filePath, 'id', ['x'], 4, 2, { kind: 'width' }), /\.line \{ white-space: pre-wrap;/);
++    assert.match(buildHunkHtml(filePath, 'id', ['x'], 4, 2, { kind: 'column', column: 100 }), /max-width: 100ch;/);
++  });
++
++  it('leaves out the removed block for a pure addition', () => {
++    assert.ok(!buildHunkHtml(filePath, 'id', [], 4, 1, { kind: 'off' }).includes('class="removed"'));
++  });
++});
+diff --git a/src/test/hunkwiseGit.test.ts b/src/test/hunkwiseGit.test.ts
+index 3422a3f..b649aae 100644
+--- a/src/test/hunkwiseGit.test.ts
++++ b/src/test/hunkwiseGit.test.ts
+@@ -285,7 +285,8 @@ describe('HunkwiseGit', () => {
+       fs.rmSync(dir2, { recursive: true, force: true });
+     });
+ 
+-    it('NFD paths from snapshot are found by listTrackedFiles as NFC', async () => {
++    // Only macOS (APFS) treats NFC and NFD file names as the same file, see pathNormalize.ts.
++    it('NFD paths from snapshot are found by listTrackedFiles as NFC', { skip: process.platform !== 'darwin' && 'macOS only' }, async () => {
+       // On macOS, readdir may return NFD paths while git ls-tree returns NFC.
+       // Both snapshot (which stores NFD from filesystem) and listTrackedFiles (NFC from git)
+       // must agree on paths so that Set/Map lookups match.
 diff --git a/src/test/rebaseBaseline.test.ts b/src/test/rebaseBaseline.test.ts
 new file mode 100644
-index 0000000..e0bf323
+index 0000000..cb5f4a0
 --- /dev/null
 +++ b/src/test/rebaseBaseline.test.ts
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,130 @@
 +import { describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { computeHunks, rebaseBaseline } from '../diffEngine';
@@ -1798,20 +2559,45 @@ index 0000000..e0bf323
 +    assert.deepEqual(hunks[0].addedContent, ['B']);
 +  });
 +
-+  it('drops a pending hunk that the change touches', () => {
-+    const result = rebaseBaseline(lines('a', 'b', 'c'), lines('a', 'B', 'c'), lines('a', 'X', 'c'));
-+    assert.deepEqual(computeHunks(result, lines('a', 'X', 'c')), []);
++  it('keeps a pending hunk that the change edits, including the edit', () => {
++    const baseline = lines('a', 'b', 'c');
++    const after = lines('a', 'X', 'c');
++    const result = rebaseBaseline(baseline, lines('a', 'B', 'c'), after);
++    assert.equal(result, baseline);
++    const hunks = computeHunks(result, after);
++    assert.equal(hunks.length, 1);
++    assert.deepEqual(hunks[0].removedContent, ['b']);
++    assert.deepEqual(hunks[0].addedContent, ['X']);
 +  });
 +
-+  it('keeps an untouched hunk while dropping a touched one', () => {
++  it('keeps both an edited and an untouched hunk', () => {
 +    const baseline = lines('a', 'b', 'c', 'd', 'e', 'f');
 +    const before = lines('a', 'B', 'c', 'd', 'E', 'f');
 +    const after = lines('a', 'B', 'c', 'd', 'Z', 'f');
 +    const result = rebaseBaseline(baseline, before, after);
-+    assert.equal(result, lines('a', 'b', 'c', 'd', 'Z', 'f'));
++    assert.equal(result, baseline);
 +    const hunks = computeHunks(result, after);
-+    assert.equal(hunks.length, 1);
++    assert.equal(hunks.length, 2);
 +    assert.deepEqual(hunks[0].addedContent, ['B']);
++    assert.deepEqual(hunks[1].addedContent, ['Z']);
++  });
++
++  it('folds a change between two pending hunks while keeping an edited one', () => {
++    const baseline = lines('a', 'b', 'c', 'd', 'e');
++    const before = lines('A', 'b', 'c', 'd', 'E');
++    const after = lines('A2', 'b', 'C', 'd', 'E');
++    const result = rebaseBaseline(baseline, before, after);
++    assert.equal(result, lines('a', 'b', 'C', 'd', 'e'));
++    const hunks = computeHunks(result, after);
++    assert.deepEqual(hunks.map(h => h.addedContent), [['A2'], ['E']]);
++  });
++
++  it('keeps a pending hunk when you delete all of its lines', () => {
++    const baseline = lines('a', 'b', 'c');
++    const after = lines('a', 'c');
++    const result = rebaseBaseline(baseline, lines('a', 'B1', 'B2', 'c'), after);
++    assert.equal(result, baseline);
++    assert.deepEqual(computeHunks(result, after).map(h => h.removedContent), [['b']]);
 +  });
 +
 +  it('shifts kept hunks past inserted and removed lines', () => {
@@ -1826,7 +2612,7 @@ index 0000000..e0bf323
 +    assert.deepEqual(hunks[0].addedContent, ['D']);
 +  });
 +
-+  it('treats a full revert (e.g. Discard Changes in Source Control) as handling every hunk', () => {
++  it('leaves no hunks after a full revert (e.g. Discard Changes in Source Control)', () => {
 +    const head = lines('a', 'b', 'c');
 +    const baseline = lines('a', 'b', 'mine', 'c');
 +    const before = lines('A', 'b', 'mine', 'c', 'claude');
@@ -1856,10 +2642,16 @@ index 0000000..e0bf323
 +    assert.deepEqual(hunks[0].removedContent, ['gone']);
 +  });
 +
-+  it('accepts a file created by the tool once the change edits it', () => {
-+    const after = lines('x', 'Y');
-+    const result = rebaseBaseline(null, lines('x', 'y'), after);
-+    assert.equal(result, after);
++  it('keeps a file created by the tool new when you edit it', () => {
++    assert.equal(rebaseBaseline(null, lines('x', 'y'), lines('x', 'Y')), null);
++  });
++
++  it('folds an insertion right before a pending hunk', () => {
++    const baseline = lines('a', 'b', 'c');
++    const after = lines('a', 'U', 'B', 'c');
++    const result = rebaseBaseline(baseline, lines('a', 'B', 'c'), after);
++    assert.equal(result, lines('a', 'U', 'b', 'c'));
++    assert.deepEqual(computeHunks(result, after).map(h => h.addedContent), [['B']]);
 +  });
 +
 +  it('handles content without a trailing newline', () => {
@@ -1876,16 +2668,17 @@ index 0000000..e0bf323
 +  });
 +});
 diff --git a/tsconfig.test.json b/tsconfig.test.json
-index 6dac5fd..c8e1b21 100644
+index 6dac5fd..3121622 100644
 --- a/tsconfig.test.json
 +++ b/tsconfig.test.json
-@@ -14,7 +14,9 @@
+@@ -14,7 +14,10 @@
      "src/diffEngine.ts",
      "src/hunkwiseGit.ts",
      "src/gitignoreManager.ts",
 -    "src/pathNormalize.ts"
 +    "src/pathNormalize.ts",
 +    "src/claudeHooks.ts",
++    "src/hunkInsetHtml.ts",
 +    "src/log.ts"
    ],
    "exclude": [
