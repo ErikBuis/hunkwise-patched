@@ -28,10 +28,10 @@ Only changes Claude makes with its file tools: `Edit`, `Write` (including new fi
 Everything else, like your own typing, a Black formatting run, or a Git discard, is accepted without a hunk. The one exception is when you edit lines inside a Claude hunk: your edit then becomes part of that hunk (as if Claude wrote it), and the hunk stays until you accept or discard it.
 
 ## Reviewing
-- Every hunk has its **Accept** and **Discard** buttons in the top right, right above it. After you click one, the editor scrolls to the next hunk and puts its buttons in exactly the same spot, so you can click through a file without moving your mouse.
-- Removed lines are shown in red above the hunk, and wrap just like the rest of the editor does.
-- The status bar (bottom right) and the editor title bar have **Accept All** and **Discard All** buttons for the file you're looking at, plus arrows to jump to the previous or next hunk. The status bar also tells you which hunk you're at (e.g. "2 of 5").
-- Files with hunks to review get a ✦ badge and an orange color in the Explorer (their folders do too), so you can see what Claude changed without opening the hunkwise panel.
+- Removed lines are shown in red above the hunk, and wrap just like the rest of the editor does. Within a hunk, the exact words that changed get a darker highlight, in the same colors as VS Code's own diffs.
+- Every hunk has its **Accept** and **Discard** buttons hovering over the top right of its removed lines, always at the right edge of the editor (even when you make it narrower). After you click one, the editor scrolls to the next hunk and puts its buttons in exactly the same spot, so you can click through a file without moving your mouse. A hunk that only adds lines has nothing to hover over, so its buttons get a line of their own above it, since VS Code doesn't let extensions draw over the editor's text.
+- To accept or discard all changes in a file (or all files) at once, use the hunkwise panel. The editor title bar also has buttons for the file you're looking at, plus arrows to jump to the previous or next hunk.
+- Files with hunks to review get a purple ✦ badge in the Explorer, and so do the folders they're in, so you can see what Claude changed without opening the hunkwise panel.
 
 ## Known limitations
 - Files Claude changes through Bash (`sed`, scripts, git) are not shown, including deleted files. Claude Code has no delete tool, and I couldn't find a way to attribute Bash changes to Claude without also catching things you did yourself at the same moment. I'd rather miss those than show false positives.

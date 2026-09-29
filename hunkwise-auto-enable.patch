@@ -57,7 +57,7 @@ index dc122e2..24c4bf7 100644
  ### Ignore rules
  
 diff --git a/package.json b/package.json
-index 8ae8760..b52c335 100644
+index 8ae8760..b20c78e 100644
 --- a/package.json
 +++ b/package.json
 @@ -42,6 +42,26 @@
@@ -145,10 +145,10 @@ index 8ae8760..b52c335 100644
 +        "id": "hunkwise.claudeChangeForeground",
 +        "description": "Color of files in the Explorer that have Claude changes to review.",
 +        "defaults": {
-+          "dark": "#E8956F",
-+          "light": "#B8532C",
-+          "highContrast": "#F2A882",
-+          "highContrastLight": "#9A3F1C"
++          "dark": "#B9A4FF",
++          "light": "#7456C9",
++          "highContrast": "#CDBDFF",
++          "highContrastLight": "#5A3DAE"
 +        }
 +      }
 +    ]
@@ -552,20 +552,26 @@ index 0a92f8b..b38d916 100644
    } finally {
      fileWatcher.clearSelfEdit(filePath);
 diff --git a/src/decorationManager.ts b/src/decorationManager.ts
-index e652a63..05e160d 100644
+index e652a63..74c1f7c 100644
 --- a/src/decorationManager.ts
 +++ b/src/decorationManager.ts
-@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
+@@ -1,91 +1,57 @@
+ import * as vscode from 'vscode';
  import { StateManager } from './stateManager';
- import { computeHunks, hunkId } from './diffEngine';
+-import { computeHunks, hunkId } from './diffEngine';
++import { changedRanges, computeHunks, hunkId, ParsedHunk } from './diffEngine';
  import { log } from './log';
-+import { buildHunkHtml, WrapMode } from './hunkInsetHtml';
++import { buildHunkHtml, RightEdge, WrapMode } from './hunkInsetHtml';
  
  // ── Added lines ──────────────────────────────────────────────────────────────
  const addedLineDecoration = vscode.window.createTextEditorDecorationType({
-@@ -9,83 +10,16 @@ const addedLineDecoration = vscode.window.createTextEditorDecorationType({
+   backgroundColor: new vscode.ThemeColor('diffEditor.insertedLineBackground'),
    isWholeLine: true,
  });
++// The parts of added lines that actually changed, darker, like in VS Code's diffs.
++const addedTextDecoration = vscode.window.createTextEditorDecorationType({
++  backgroundColor: new vscode.ThemeColor('diffEditor.insertedTextBackground'),
++});
  
 -// ── HTML helpers ─────────────────────────────────────────────────────────────
 -function escapeHtml(s: string): string {
@@ -574,8 +580,25 @@ index e652a63..05e160d 100644
 -    .replace(/</g, '&lt;')
 -    .replace(/>/g, '&gt;')
 -    .replace(/"/g, '&quot;');
--}
--
++/** Highlight the added lines of hunks, and their changed parts. */
++function highlightAdded(editor: vscode.TextEditor, hunks: ParsedHunk[]): void {
++  const lines: vscode.Range[] = [];
++  const changed: vscode.Range[] = [];
++  const lineCount = editor.document.lineCount;
++  for (const hunk of hunks) {
++    for (let i = 0; i < hunk.newLines; i++) {
++      const lineIdx = hunk.newStart - 1 + i;
++      if (lineIdx < lineCount) lines.push(editor.document.lineAt(lineIdx).range);
++    }
++    for (const r of changedRanges(hunk.removedContent, hunk.addedContent).added) {
++      const lineIdx = hunk.newStart - 1 + r.line;
++      if (lineIdx < lineCount) changed.push(new vscode.Range(lineIdx, r.start, lineIdx, r.end));
++    }
++  }
++  editor.setDecorations(addedLineDecoration, lines);
++  editor.setDecorations(addedTextDecoration, changed);
+ }
+ 
 -// ── Deleted-lines inset ───────────────────────────────────────────────────────
 -function buildDeletedHtml(lines: string[], tabSize: number): string {
 -  const rows = lines.map(l => `<div class="line">${escapeHtml(l)}</div>`).join('');
@@ -594,8 +617,18 @@ index e652a63..05e160d 100644
 -.line { white-space: pre; overflow: hidden; text-overflow: ellipsis; tab-size: ${tabSize}; }
 -</style>
 -</head><body>${rows}</body></html>`;
--}
--
++function wrapModeFor(editor: vscode.TextEditor): WrapMode {
++  const config = vscode.workspace.getConfiguration('editor', editor.document);
++  const column = config.get<number>('wordWrapColumn', 80);
++  switch (config.get<string>('wordWrap', 'off')) {
++    case 'on': return { kind: 'width' };
++    case 'wordWrapColumn': return { kind: 'column', column };
++    // Wraps at the column or the editor width, whichever comes first.
++    case 'bounded': return { kind: 'column', column };
++    default: return { kind: 'off' };
++  }
+ }
+ 
 -// ── Action-bar inset ──────────────────────────────────────────────────────────
 -function buildActionsHtml(filePath: string, hunkId: string): string {
 -  return `<!DOCTYPE html><html><head>
@@ -644,20 +677,17 @@ index e652a63..05e160d 100644
 -function discard() { vscode.postMessage({ command: 'discard', filePath: ${JSON.stringify(filePath)}, hunkId: ${JSON.stringify(hunkId)} }); }
 -</script>
 -</body></html>`;
-+function wrapModeFor(editor: vscode.TextEditor): WrapMode {
++function rightEdgeFor(editor: vscode.TextEditor): RightEdge {
 +  const config = vscode.workspace.getConfiguration('editor', editor.document);
-+  const column = config.get<number>('wordWrapColumn', 80);
-+  switch (config.get<string>('wordWrap', 'off')) {
-+    case 'on': return { kind: 'width' };
-+    case 'wordWrapColumn': return { kind: 'column', column };
-+    // Wraps at the column or the editor width, whichever comes first.
-+    case 'bounded': return { kind: 'column', column };
-+    default: return { kind: 'off' };
-+  }
++  const minimapOnRight = config.get<boolean>('minimap.enabled', true) && config.get<string>('minimap.side', 'right') === 'right';
++  return {
++    scrollbarWidth: config.get<number>('scrollbar.verticalScrollbarSize', 14),
++    minimap: minimapOnRight ? { maxColumn: config.get<number>('minimap.maxColumn', 120), scale: config.get<number>('minimap.scale', 1) } : undefined,
++  };
  }
  
  interface HunkInset {
-@@ -94,9 +28,17 @@ interface HunkInset {
+@@ -94,9 +60,17 @@ interface HunkInset {
    disposeListener: vscode.Disposable;
    // Cache key: used to detect whether this inset can be reused
    cacheKey: string;
@@ -675,7 +705,7 @@ index e652a63..05e160d 100644
  function insetCacheKey(afterLine: number, height: number): string {
    return `${afterLine}:${height}`;
  }
-@@ -104,11 +46,14 @@ function insetCacheKey(afterLine: number, height: number): string {
+@@ -104,11 +78,14 @@ function insetCacheKey(afterLine: number, height: number): string {
  export class DecorationManager {
    // editorKey → ordered list of insets for that editor
    private insets: Map<string, HunkInset[]> = new Map();
@@ -692,7 +722,7 @@ index e652a63..05e160d 100644
    ) {
      this.onAction = onAction;
    }
-@@ -121,6 +66,35 @@ export class DecorationManager {
+@@ -121,6 +98,28 @@ export class DecorationManager {
      }
    }
  
@@ -707,14 +737,7 @@ index e652a63..05e160d 100644
 +      this.refresh([editor]);
 +      return;
 +    }
-+    const ranges: vscode.Range[] = [];
-+    for (const hunk of computeHunks(fileState.baseline, editor.document.getText())) {
-+      for (let i = 0; i < hunk.newLines; i++) {
-+        const lineIdx = hunk.newStart - 1 + i;
-+        if (lineIdx < editor.document.lineCount) ranges.push(editor.document.lineAt(lineIdx).range);
-+      }
-+    }
-+    editor.setDecorations(addedLineDecoration, ranges);
++    highlightAdded(editor, computeHunks(fileState.baseline, editor.document.getText()));
 +
 +    const existing = this.insetTimers.get(editorKey);
 +    if (existing) clearTimeout(existing);
@@ -728,7 +751,7 @@ index e652a63..05e160d 100644
    refreshActionBar(_editor: vscode.TextEditor): void { /* buttons live in insets */ }
  
    private disposeInsetList(list: HunkInset[]): void {
-@@ -150,6 +124,11 @@ export class DecorationManager {
+@@ -150,6 +149,11 @@ export class DecorationManager {
      const filePath = editor.document.uri.fsPath;
      const editorKey = editor.document.uri.toString();
      const fileState = this.stateManager.getFile(filePath);
@@ -740,15 +763,23 @@ index e652a63..05e160d 100644
  
      // Skip insets: in diff editors (viewColumn undefined), or when user disabled inline decorations
      const isInDiff = editor.viewColumn === undefined && diffPaths.has(filePath);
-@@ -164,6 +143,7 @@ export class DecorationManager {
+@@ -158,12 +162,13 @@ export class DecorationManager {
+     if (!fileState || fileState.status !== 'reviewing' || skipInsets) {
+       this.disposeInsetList(this.insets.get(editorKey) ?? []);
+       this.insets.delete(editorKey);
+-      editor.setDecorations(addedLineDecoration, []);
++      highlightAdded(editor, []);
+       return;
+     }
  
-     const addedRanges: vscode.Range[] = [];
+-    const addedRanges: vscode.Range[] = [];
      const tabSize = editor.options.tabSize as number || 4;
 +    const wrap = wrapModeFor(editor);
++    const rightEdge = rightEdgeFor(editor);
      const parsed = computeHunks(fileState.baseline, editor.document.getText());
  
      // Build the desired inset specs first
-@@ -171,13 +151,11 @@ export class DecorationManager {
+@@ -171,79 +176,32 @@ export class DecorationManager {
        afterLine: number;
        height: number;
        html: string;
@@ -760,13 +791,13 @@ index e652a63..05e160d 100644
 -      const id = hunkId(hunk);
 -
 -
-       for (let i = 0; i < hunk.newLines; i++) {
-         const lineIdx = hunk.newStart - 1 + i;
-         if (lineIdx < editor.document.lineCount) {
-@@ -185,65 +163,26 @@ export class DecorationManager {
-         }
-       }
- 
+-      for (let i = 0; i < hunk.newLines; i++) {
+-        const lineIdx = hunk.newStart - 1 + i;
+-        if (lineIdx < editor.document.lineCount) {
+-          addedRanges.push(editor.document.lineAt(lineIdx).range);
+-        }
+-      }
+-
 -      // ── Inset placement strategy ──
 -      //
 -      // Layout order (top → bottom):
@@ -824,14 +855,15 @@ index e652a63..05e160d 100644
 +      // the hunk's first line, or, for a pure deletion, right where the lines were removed.
 +      const afterLine = Math.max(-1, hunk.newStart - 2);
 +      const measureKey = `${editorKey}|${JSON.stringify(wrap)}|${tabSize}|${hunk.removedContent.join('\n')}`;
-+      const height = this.measuredHeights.get(measureKey) ?? 1 + hunk.removedContent.length;
++      const height = this.measuredHeights.get(measureKey) ?? Math.max(1, hunk.removedContent.length);
++      const changed = changedRanges(hunk.removedContent, hunk.addedContent).removed;
        specs.push({
 -        afterLine: actionAfterLine,
 -        height: 2,
 -        html: buildActionsHtml(filePath, id),
 +        afterLine,
 +        height,
-+        html: buildHunkHtml(filePath, hunkId(hunk), hunk.removedContent, tabSize, height, wrap),
++        html: buildHunkHtml(filePath, hunkId(hunk), hunk.removedContent, changed, tabSize, height, wrap, rightEdge),
 +        measureKey,
        });
      }
@@ -845,7 +877,7 @@ index e652a63..05e160d 100644
      // Reuse existing insets when cache keys match to avoid flicker
      const existing = this.insets.get(editorKey) ?? [];
      const nextInsets: HunkInset[] = [];
-@@ -253,13 +192,17 @@ export class DecorationManager {
+@@ -253,13 +211,17 @@ export class DecorationManager {
        const key = insetCacheKey(spec.afterLine, spec.height);
        const prev = existing[i];
        if (prev && prev.cacheKey === key && !prev.disposed) {
@@ -866,7 +898,16 @@ index e652a63..05e160d 100644
          if (created) nextInsets.push(created);
        }
      }
-@@ -288,6 +231,7 @@ export class DecorationManager {
+@@ -273,7 +235,7 @@ export class DecorationManager {
+       }
+     }
+ 
+-    editor.setDecorations(addedLineDecoration, addedRanges);
++    highlightAdded(editor, parsed);
+     if (nextInsets.length > 0) {
+       this.insets.set(editorKey, nextInsets);
+     } else {
+@@ -288,6 +250,7 @@ export class DecorationManager {
      height: number,
      html: string,
      cacheKey: string,
@@ -874,7 +915,7 @@ index e652a63..05e160d 100644
    ): HunkInset | undefined {
      try {
        const inset = (vscode.window as any).createWebviewTextEditorInset(
-@@ -296,11 +240,16 @@ export class DecorationManager {
+@@ -296,11 +259,16 @@ export class DecorationManager {
        inset.webview.html = html;
        const disposable = inset.webview.onDidReceiveMessage((msg: any) => {
          if (msg.command === 'accept' || msg.command === 'discard') {
@@ -893,20 +934,22 @@ index e652a63..05e160d 100644
          disposeListener: inset.onDidDispose(() => {
            entry.disposed = true;
            // Re-apply if editor is still visible so insets are immediately rebuilt
-@@ -318,6 +267,8 @@ export class DecorationManager {
+@@ -318,7 +286,10 @@ export class DecorationManager {
    }
  
    dispose(): void {
 +    for (const timer of this.insetTimers.values()) clearTimeout(timer);
 +    this.insetTimers.clear();
      addedLineDecoration.dispose();
++    addedTextDecoration.dispose();
      for (const list of this.insets.values()) {
        this.disposeInsetList(list);
+     }
 diff --git a/src/diffEngine.ts b/src/diffEngine.ts
-index 96e6c36..9979964 100644
+index 96e6c36..6a0a012 100644
 --- a/src/diffEngine.ts
 +++ b/src/diffEngine.ts
-@@ -73,3 +73,81 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
+@@ -73,3 +73,133 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
    return hunks;
  }
  
@@ -987,6 +1030,58 @@ index 96e6c36..9979964 100644
 +    result.splice(c.oldStart + shift, c.oldEnd - c.oldStart, ...afterTokens.slice(c.newStart, c.newEnd));
 +  }
 +  return result.join('');
++}
++
++// ── Changed characters ──────────────────────────────────────────────────────
++
++/** A character range [start, end) within one line of a hunk's removed or added lines. */
++export interface LineRange { line: number; start: number; end: number }
++
++// Beyond this many characters, a hunk only gets whole-line highlights (word diffs get slow).
++const MAX_CHANGED_RANGES_CHARS = 20000;
++
++/**
++ * The parts of a hunk's lines that actually changed, word by word, like the darker highlights
++ * in VS Code's diff editor. Pure additions and deletions have none, since every line changed.
++ */
++export function changedRanges(removed: string[], added: string[]): { removed: LineRange[]; added: LineRange[] } {
++  const result = { removed: [] as LineRange[], added: [] as LineRange[] };
++  if (removed.length === 0 || added.length === 0) return result;
++  const oldText = removed.join('\n');
++  const newText = added.join('\n');
++  if (oldText.length + newText.length > MAX_CHANGED_RANGES_CHARS) return result;
++  let oldPos = 0;
++  let newPos = 0;
++  for (const part of Diff.diffWordsWithSpace(oldText, newText)) {
++    const length = part.value.length;
++    if (part.removed) {
++      addLineRanges(result.removed, removed, oldPos, oldPos + length);
++      oldPos += length;
++    } else if (part.added) {
++      addLineRanges(result.added, added, newPos, newPos + length);
++      newPos += length;
++    } else {
++      oldPos += length;
++      newPos += length;
++    }
++  }
++  return result;
++}
++
++/** Split the text range [start, end) of lines.join('\n') into per-line ranges (line breaks left out). */
++function addLineRanges(out: LineRange[], lines: string[], start: number, end: number): void {
++  let lineStart = 0;
++  for (let line = 0; line < lines.length && lineStart < end; line++) {
++    const lineEnd = lineStart + lines[line].length;
++    const from = Math.max(start, lineStart);
++    const to = Math.min(end, lineEnd);
++    if (from < to) {
++      const last = out[out.length - 1];
++      if (last && last.line === line && last.end === from - lineStart) last.end = to - lineStart;
++      else out.push({ line, start: from - lineStart, end: to - lineStart });
++    }
++    lineStart = lineEnd + 1;
++  }
 +}
 diff --git a/src/extension.ts b/src/extension.ts
 index d78cdf8..17b3d11 100644
@@ -1821,11 +1916,12 @@ index f1ef23e..ca3f830 100644
 +}
 diff --git a/src/hunkInsetHtml.ts b/src/hunkInsetHtml.ts
 new file mode 100644
-index 0000000..d937ada
+index 0000000..a9c42f1
 --- /dev/null
 +++ b/src/hunkInsetHtml.ts
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,162 @@
 +// HTML of the inset hunkwise shows above each hunk. Kept free of the vscode API so it can be unit tested.
++import type { LineRange } from './diffEngine';
 +
 +// ── HTML helpers ─────────────────────────────────────────────────────────────
 +function escapeHtml(s: string): string {
@@ -1836,20 +1932,60 @@ index 0000000..d937ada
 +    .replace(/"/g, '&quot;');
 +}
 +
++/** One removed line as HTML, with its changed parts (sorted, non-overlapping) highlighted. */
++function lineHtml(text: string, changed: LineRange[]): string {
++  let html = '';
++  let pos = 0;
++  for (const { start, end } of changed) {
++    html += escapeHtml(text.slice(pos, start)) + `<span class="changed">${escapeHtml(text.slice(start, end))}</span>`;
++    pos = end;
++  }
++  return html + escapeHtml(text.slice(pos));
++}
++
 +// ── Hunk inset ────────────────────────────────────────────────────────────────
 +//
-+// One inset per hunk, right above its first line: a row with the Accept / Discard buttons at the
-+// right (always in the same spot, like Copilot's), followed by the removed lines (if any).
++// One inset per hunk, right above its first line. It shows the removed lines (if any), with the
++// Accept / Discard buttons hovering over the top right of them, always in the same spot (like
++// Copilot's). An extension can't draw over the editor's own text, so the inset of a pure
++// addition is a line of its own with just the buttons.
 +//
 +// An inset's height is a whole number of editor lines, set when it is created. The webview
 +// derives the editor's line height from its own height, and reports back how many lines it
 +// really needs (removed lines can wrap), so the inset is recreated at that height.
++//
++// An inset is as wide as the editor's longest line has ever been (VS Code doesn't shrink it right
++// away when the editor gets narrower), so its right edge can be far outside the editor. The
++// webview therefore finds out which part of it is actually visible (an IntersectionObserver
++// reports that, clipped by the editor) and keeps the buttons at the right of that part, clear of
++// the minimap and the scrollbar.
 +
 +/** How the removed lines wrap: not at all, at the editor width, or at a column. */
 +export type WrapMode = { kind: 'off' } | { kind: 'width' } | { kind: 'column'; column: number };
 +
-+export function buildHunkHtml(filePath: string, hunkId: string, removed: string[], tabSize: number, heightLines: number, wrap: WrapMode): string {
-+  const rows = removed.map(l => `<div class="line">${escapeHtml(l) || ' '}</div>`).join('');
++/** What covers the right side of the editor: its vertical scrollbar and (if on the right) the minimap. */
++export interface RightEdge {
++  scrollbarWidth: number;
++  minimap?: { maxColumn: number; scale: number };
++}
++
++/**
++ * Build the inset of one hunk. changed holds the parts of the removed lines that actually
++ * changed (see changedRanges()), which get the same darker highlight as in VS Code's diffs.
++ */
++export function buildHunkHtml(
++  filePath: string,
++  hunkId: string,
++  removed: string[],
++  changed: LineRange[],
++  tabSize: number,
++  heightLines: number,
++  wrap: WrapMode,
++  rightEdge: RightEdge,
++): string {
++  const rows = removed
++    .map((text, i) => `<div class="line">${lineHtml(text, changed.filter(r => r.line === i)) || ' '}</div>`)
++    .join('');
 +  const lineStyle = wrap.kind === 'off'
 +    ? 'white-space: pre; overflow: hidden; text-overflow: ellipsis;'
 +    : `white-space: pre-wrap; overflow-wrap: anywhere;${wrap.kind === 'column' ? ` max-width: ${wrap.column}ch;` : ''}`;
@@ -1867,35 +2003,35 @@ index 0000000..d937ada
 +  font-weight: var(--vscode-editor-font-weight, normal);
 +  line-height: var(--lh);
 +}
++#content { position: relative; min-height: var(--lh); }
++/* A full-width strip whose visible part tells where the editor's right edge is. */
++#probe { position: absolute; top: 0; left: 0; right: 0; height: 1px; pointer-events: none; }
 +.bar {
++  position: absolute; top: 0; right: 0; z-index: 1;
 +  height: var(--lh);
-+  display: flex; align-items: center; justify-content: flex-end; gap: 4px;
-+  /* Keep clear of the editor's vertical scrollbar. */
-+  padding-right: 18px;
++  display: flex; align-items: center; gap: 4px;
 +}
 +.removed { background: var(--vscode-diffEditor-removedLineBackground, rgba(255,0,0,0.1)); }
 +.line { ${lineStyle} tab-size: ${tabSize}; }
++.changed { background: var(--vscode-diffEditor-removedTextBackground, rgba(255,0,0,0.2)); }
 +button {
-+  background: var(--vscode-button-secondaryBackground, #3a3d41);
-+  color: var(--vscode-button-secondaryForeground, #cccccc);
-+  border: 1px solid var(--vscode-button-border, rgba(128,128,128,0.4));
++  border: 1px solid transparent;
 +  border-radius: 3px;
 +  padding: 0 6px; font-size: 11px;
 +  font-family: var(--vscode-font-family, sans-serif);
 +  cursor: pointer; height: min(20px, calc(var(--lh) - 2px)); line-height: 1;
 +  display: inline-flex; align-items: center; white-space: nowrap;
++  box-shadow: 0 1px 3px var(--vscode-widget-shadow, rgba(0,0,0,0.35));
 +}
-+button:hover { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
-+.btn-accept {
-+  background: var(--vscode-button-background, #2a7d3a);
-+  color: var(--vscode-button-foreground, #ffffff);
-+  border-color: transparent;
-+}
-+.btn-accept:hover { background: var(--vscode-button-hoverBackground, #256b31); }
++.btn-accept { background: #2a7d3a; color: #d4f0da; border-color: rgba(63,185,80,0.3); }
++.btn-accept:hover { background: #256b31; }
++.btn-discard { background: #6e2a27; color: #f5d0cd; border-color: rgba(248,81,73,0.35); }
++.btn-discard:hover { background: #5c2321; }
 +</style>
 +</head><body>
 +<div id="content">
-+<div class="bar">
++<div id="probe"></div>
++<div class="bar" id="bar">
 +<button class="btn-accept" title="Accept this change" onclick="send(${escapeHtml(message('accept'))})">✓ Accept</button>
 +<button class="btn-discard" title="Discard this change" onclick="send(${escapeHtml(message('discard'))})">↺ Discard</button>
 +</div>
@@ -1904,7 +2040,37 @@ index 0000000..d937ada
 +<script>
 +const vscode = acquireVsCodeApi();
 +const HEIGHT_LINES = ${heightLines};
++const RIGHT_EDGE = ${JSON.stringify(rightEdge)};
 +function send(msg) { vscode.postMessage(msg); }
++
++// Width covered by the scrollbar and minimap, the way VS Code computes the minimap's maximum width.
++function coveredWidth() {
++  let width = RIGHT_EDGE.scrollbarWidth + 6;
++  if (RIGHT_EDGE.minimap) {
++    const ratio = window.devicePixelRatio || 1;
++    const scale = ratio >= 2 ? Math.round(RIGHT_EDGE.minimap.scale * 2) : RIGHT_EDGE.minimap.scale;
++    width += Math.floor(RIGHT_EDGE.minimap.maxColumn * scale / ratio) + 8;
++  }
++  return width;
++}
++const bar = document.getElementById('bar');
++let visibleRight = window.innerWidth;
++function placeBar() {
++  bar.style.right = Math.max(0, window.innerWidth - visibleRight + coveredWidth()) + 'px';
++}
++placeBar();
++if (typeof IntersectionObserver === 'function') {
++  const thresholds = Array.from({ length: 501 }, (_, i) => i / 500);
++  new IntersectionObserver(entries => {
++    for (const entry of entries) {
++      if (entry.isIntersecting && entry.intersectionRect.width > 0) {
++        visibleRight = Math.min(window.innerWidth, entry.intersectionRect.right);
++        placeBar();
++      }
++    }
++  }, { threshold: thresholds }).observe(document.getElementById('probe'));
++}
++window.addEventListener('resize', placeBar);
 +function measure() {
 +  const lineHeight = window.innerHeight / HEIGHT_LINES;
 +  if (!lineHeight) return;
@@ -2035,11 +2201,12 @@ index 92e57f6..b941a62 100644
            try { currentContent = fs.readFileSync(filePath, 'utf-8'); } catch { currentContent = ''; }
 diff --git a/src/reviewUi.ts b/src/reviewUi.ts
 new file mode 100644
-index 0000000..0284b6d
+index 0000000..960b379
 --- /dev/null
 +++ b/src/reviewUi.ts
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,136 @@
 +import * as vscode from 'vscode';
++import * as path from 'path';
 +import { StateManager } from './stateManager';
 +import { computeHunks, ParsedHunk } from './diffEngine';
 +import { normalizePath } from './pathNormalize';
@@ -2072,31 +2239,45 @@ index 0000000..0284b6d
 +export class ReviewDecorationProvider implements vscode.FileDecorationProvider, vscode.Disposable {
 +  private readonly emitter = new vscode.EventEmitter<vscode.Uri[]>();
 +  readonly onDidChangeFileDecorations = this.emitter.event;
-+  private decorated: Set<string> = new Set();
++  // Decorated paths: files under review, and every folder that contains one.
++  private files: Set<string> = new Set();
++  private folders: Set<string> = new Set();
 +
 +  constructor(private readonly stateManager: StateManager) {}
 +
 +  provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
 +    if (uri.scheme !== 'file') return undefined;
-+    const state = this.stateManager.getFile(normalizePath(uri.fsPath));
-+    if (state?.status !== 'reviewing') return undefined;
-+    const decoration = new vscode.FileDecoration(
-+      '✦',
-+      state.baseline === null ? 'Created by Claude, not reviewed yet' : 'Changed by Claude, not reviewed yet',
-+      new vscode.ThemeColor('hunkwise.claudeChangeForeground'),
-+    );
-+    decoration.propagate = true;
-+    return decoration;
++    const filePath = normalizePath(uri.fsPath);
++    const color = new vscode.ThemeColor('hunkwise.claudeChangeForeground');
++    if (this.files.has(filePath)) {
++      const isNew = this.stateManager.getFile(filePath)?.baseline === null;
++      return new vscode.FileDecoration('✦', isNew ? 'Created by Claude, not reviewed yet' : 'Changed by Claude, not reviewed yet', color);
++    }
++    // Folders get their own decoration instead of a propagated one, which VS Code shows as a
++    // plain dot that is easily hidden behind Git's.
++    if (this.folders.has(filePath)) return new vscode.FileDecoration('✦', 'Contains Claude changes that are not reviewed yet', color);
++    return undefined;
 +  }
 +
 +  /** Update the Explorer after files entered or left review. */
 +  refresh(): void {
-+    const now = new Set<string>();
++    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
++    const files = new Set<string>();
++    const folders = new Set<string>();
 +    for (const [filePath, state] of this.stateManager.getAllFiles()) {
-+      if (state.status === 'reviewing') now.add(filePath);
++      if (state.status !== 'reviewing') continue;
++      files.add(filePath);
++      for (let dir = path.dirname(filePath); root && dir.length >= root.length && !folders.has(dir); dir = path.dirname(dir)) {
++        folders.add(dir);
++        if (dir === path.dirname(dir)) break;
++      }
 +    }
-+    const changed = [...now].filter(p => !this.decorated.has(p)).concat([...this.decorated].filter(p => !now.has(p)));
-+    this.decorated = now;
++    const changed = [
++      ...symmetricDifference(this.files, files),
++      ...symmetricDifference(this.folders, folders),
++    ];
++    this.files = files;
++    this.folders = folders;
 +    if (changed.length > 0) this.emitter.fire(changed.map(p => vscode.Uri.file(p)));
 +  }
 +
@@ -2105,39 +2286,22 @@ index 0000000..0284b6d
 +  }
 +}
 +
++function symmetricDifference(a: Set<string>, b: Set<string>): string[] {
++  return [...a].filter(x => !b.has(x)).concat([...b].filter(x => !a.has(x)));
++}
++
 +/**
-+ * Controls for the file in the active editor, like Copilot's: previous / next hunk, "2 of 5",
-+ * and Accept All / Discard All, in the status bar (bottom right) and in the editor title bar.
++ * Commands for the file in the active editor: previous / next hunk, and Accept All / Discard
++ * All. They are in the editor title bar while the file has hunks.
 + */
 +export class ActiveFileControls implements vscode.Disposable {
-+  private readonly items: vscode.StatusBarItem[];
-+  private readonly counter: vscode.StatusBarItem;
 +  private readonly disposables: vscode.Disposable[] = [];
-+  private timer: NodeJS.Timeout | undefined;
 +
 +  constructor(
 +    private readonly stateManager: StateManager,
 +    acceptFile: (filePath: string) => Thenable<void> | void,
 +    discardFile: (filePath: string) => Thenable<void> | void,
 +  ) {
-+    // Right-aligned items with a lower priority are shown further to the right.
-+    const item = (priority: number, text: string, tooltip: string, command?: string) => {
-+      const created = vscode.window.createStatusBarItem('hunkwise.' + (command ?? 'counter'), vscode.StatusBarAlignment.Right, priority);
-+      created.name = 'hunkwise: ' + tooltip;
-+      created.text = text;
-+      created.tooltip = tooltip;
-+      created.command = command;
-+      return created;
-+    };
-+    this.counter = item(-1001, '', 'Claude change in this file');
-+    this.items = [
-+      item(-1000, '$(chevron-up)', 'Previous Claude change', 'hunkwise.previousHunk'),
-+      this.counter,
-+      item(-1002, '$(chevron-down)', 'Next Claude change', 'hunkwise.nextHunk'),
-+      item(-1003, '$(check-all) Accept All', 'Accept all Claude changes in this file', 'hunkwise.acceptAllInFile'),
-+      item(-1004, '$(discard) Discard All', 'Discard all Claude changes in this file', 'hunkwise.discardAllInFile'),
-+    ];
-+
 +    const withActiveFile = (action: (filePath: string) => Thenable<void> | void) => async () => {
 +      const editor = vscode.window.activeTextEditor;
 +      if (editor && hunksOf(this.stateManager, editor.document).length > 0) {
@@ -2145,14 +2309,11 @@ index 0000000..0284b6d
 +      }
 +    };
 +    this.disposables.push(
-+      ...this.items,
 +      vscode.commands.registerCommand('hunkwise.nextHunk', () => this.navigate(1)),
 +      vscode.commands.registerCommand('hunkwise.previousHunk', () => this.navigate(-1)),
 +      vscode.commands.registerCommand('hunkwise.acceptAllInFile', withActiveFile(acceptFile)),
 +      vscode.commands.registerCommand('hunkwise.discardAllInFile', withActiveFile(discardFile)),
 +      vscode.window.onDidChangeActiveTextEditor(() => this.refresh()),
-+      vscode.window.onDidChangeTextEditorSelection(e => { if (e.textEditor === vscode.window.activeTextEditor) this.refreshSoon(); }),
-+      vscode.workspace.onDidChangeTextDocument(e => { if (e.document === vscode.window.activeTextEditor?.document) this.refreshSoon(); }),
 +    );
 +    this.refresh();
 +  }
@@ -2170,32 +2331,13 @@ index 0000000..0284b6d
 +    revealHunk(editor, target);
 +  }
 +
-+  private refreshSoon(): void {
-+    if (this.timer) clearTimeout(this.timer);
-+    this.timer = setTimeout(() => this.refresh(), 150);
-+  }
-+
 +  refresh(): void {
-+    if (this.timer) clearTimeout(this.timer);
-+    this.timer = undefined;
 +    const editor = vscode.window.activeTextEditor;
-+    const hunks = editor ? hunksOf(this.stateManager, editor.document) : [];
-+    void vscode.commands.executeCommand('setContext', HAS_HUNKS_CONTEXT, hunks.length > 0);
-+    if (!editor || hunks.length === 0) {
-+      for (const i of this.items) i.hide();
-+      return;
-+    }
-+    // The current hunk is the one the cursor is in, or else the last one before it.
-+    const line = editor.selection.active.line;
-+    let current = 0;
-+    hunks.forEach((h, i) => { if (h.newStart - 1 <= line) current = i; });
-+    const inside = hunks[current].newStart - 1 <= line && line < hunks[current].newStart - 1 + Math.max(1, hunks[current].newLines);
-+    this.counter.text = inside ? `${current + 1} of ${hunks.length}` : `${hunks.length} change${hunks.length === 1 ? '' : 's'}`;
-+    for (const i of this.items) i.show();
++    const hasHunks = !!editor && hunksOf(this.stateManager, editor.document).length > 0;
++    void vscode.commands.executeCommand('setContext', HAS_HUNKS_CONTEXT, hasHunks);
 +  }
 +
 +  dispose(): void {
-+    if (this.timer) clearTimeout(this.timer);
 +    this.disposables.forEach(d => d.dispose());
 +  }
 +}
@@ -2229,6 +2371,45 @@ index 505450d..26dd60b 100644
    // ── accessors ─────────────────────────────────────────────────────────────
  
    get enabled(): boolean { return this._enabled; }
+diff --git a/src/test/changedRanges.test.ts b/src/test/changedRanges.test.ts
+new file mode 100644
+index 0000000..63af481
+--- /dev/null
++++ b/src/test/changedRanges.test.ts
+@@ -0,0 +1,33 @@
++import { describe, it } from 'node:test';
++import assert from 'node:assert/strict';
++import { changedRanges } from '../diffEngine';
++
++describe('changedRanges', () => {
++  it('highlights only the changed word', () => {
++    const result = changedRanges(['const x = 1;'], ['const y = 1;']);
++    assert.deepEqual(result.removed, [{ line: 0, start: 6, end: 7 }]);
++    assert.deepEqual(result.added, [{ line: 0, start: 6, end: 7 }]);
++  });
++
++  it('splits changes across lines and leaves out line breaks', () => {
++    const result = changedRanges(['a b', 'c d'], ['a X', 'Y d']);
++    assert.deepEqual(result.added, [{ line: 0, start: 2, end: 3 }, { line: 1, start: 0, end: 1 }]);
++    assert.deepEqual(result.removed, [{ line: 0, start: 2, end: 3 }, { line: 1, start: 0, end: 1 }]);
++  });
++
++  it('covers an inserted line in full', () => {
++    const result = changedRanges(['a'], ['a', 'new line']);
++    assert.deepEqual(result.removed, []);
++    assert.deepEqual(result.added, [{ line: 1, start: 0, end: 8 }]);
++  });
++
++  it('has no ranges for pure additions and deletions', () => {
++    assert.deepEqual(changedRanges([], ['a']), { removed: [], added: [] });
++    assert.deepEqual(changedRanges(['a'], []), { removed: [], added: [] });
++  });
++
++  it('skips very large hunks', () => {
++    const big = ['x'.repeat(30000)];
++    assert.deepEqual(changedRanges(big, ['y']), { removed: [], added: [] });
++  });
++});
 diff --git a/src/test/claudeHooks.test.ts b/src/test/claudeHooks.test.ts
 new file mode 100644
 index 0000000..360b0b8
@@ -2461,10 +2642,10 @@ index 0000000..360b0b8
 +});
 diff --git a/src/test/hunkInsetHtml.test.ts b/src/test/hunkInsetHtml.test.ts
 new file mode 100644
-index 0000000..6a59e89
+index 0000000..31144d0
 --- /dev/null
 +++ b/src/test/hunkInsetHtml.test.ts
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,60 @@
 +import { describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { buildHunkHtml } from '../hunkInsetHtml';
@@ -2478,11 +2659,13 @@ index 0000000..6a59e89
 +  return [...html.matchAll(/onclick="([^"]*)"/g)].map(m => unescapeHtml(m[1]));
 +}
 +
++const EDGE = { scrollbarWidth: 14, minimap: { maxColumn: 120, scale: 1 } };
++
 +describe('buildHunkHtml', () => {
 +  const filePath = 'C:\\Users\\me\\"quoted" <dir>\\file.ts';
 +
 +  it('produces a script and click handlers that parse', () => {
-+    const html = buildHunkHtml(filePath, '3:1:3:1', ['old line'], 4, 2, { kind: 'width' });
++    const html = buildHunkHtml(filePath, '3:1:3:1', ['old line'], [], 4, 2, { kind: 'width' }, EDGE);
 +    const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
 +    assert.ok(script);
 +    assert.doesNotThrow(() => new Function(script));
@@ -2492,7 +2675,7 @@ index 0000000..6a59e89
 +  });
 +
 +  it('sends the file path and hunk id unchanged', () => {
-+    const html = buildHunkHtml(filePath, '3:1:3:1', [], 4, 1, { kind: 'off' });
++    const html = buildHunkHtml(filePath, '3:1:3:1', [], [], 4, 1, { kind: 'off' }, EDGE);
 +    const sent: unknown[] = [];
 +    for (const handler of onclickHandlers(html)) new Function('send', handler)((msg: unknown) => sent.push(msg));
 +    assert.deepEqual(sent, [
@@ -2502,19 +2685,25 @@ index 0000000..6a59e89
 +  });
 +
 +  it('escapes removed lines', () => {
-+    const html = buildHunkHtml(filePath, 'id', ['<script>alert(1)</script> & "x"'], 4, 2, { kind: 'off' });
++    const html = buildHunkHtml(filePath, 'id', ['<script>alert(1)</script> & "x"'], [], 4, 2, { kind: 'off' }, EDGE);
 +    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;x&quot;'));
 +    assert.equal(html.match(/<script>/g)?.length, 1);
 +  });
 +
 +  it('wraps removed lines only when the editor wraps', () => {
-+    assert.match(buildHunkHtml(filePath, 'id', ['x'], 4, 2, { kind: 'off' }), /\.line \{ white-space: pre;/);
-+    assert.match(buildHunkHtml(filePath, 'id', ['x'], 4, 2, { kind: 'width' }), /\.line \{ white-space: pre-wrap;/);
-+    assert.match(buildHunkHtml(filePath, 'id', ['x'], 4, 2, { kind: 'column', column: 100 }), /max-width: 100ch;/);
++    assert.match(buildHunkHtml(filePath, 'id', ['x'], [], 4, 2, { kind: 'off' }, EDGE), /\.line \{ white-space: pre;/);
++    assert.match(buildHunkHtml(filePath, 'id', ['x'], [], 4, 2, { kind: 'width' }, EDGE), /\.line \{ white-space: pre-wrap;/);
++    assert.match(buildHunkHtml(filePath, 'id', ['x'], [], 4, 2, { kind: 'column', column: 100 }, EDGE), /max-width: 100ch;/);
++  });
++
++  it('highlights the changed parts of removed lines', () => {
++    const html = buildHunkHtml(filePath, 'id', ['const x = 1;', 'a<b'], [{ line: 0, start: 6, end: 7 }, { line: 1, start: 1, end: 2 }], 4, 2, { kind: 'off' }, EDGE);
++    assert.ok(html.includes('<div class="line">const <span class="changed">x</span> = 1;</div>'));
++    assert.ok(html.includes('<div class="line">a<span class="changed">&lt;</span>b</div>'));
 +  });
 +
 +  it('leaves out the removed block for a pure addition', () => {
-+    assert.ok(!buildHunkHtml(filePath, 'id', [], 4, 1, { kind: 'off' }).includes('class="removed"'));
++    assert.ok(!buildHunkHtml(filePath, 'id', [], [], 4, 1, { kind: 'off' }, EDGE).includes('class="removed"'));
 +  });
 +});
 diff --git a/src/test/hunkwiseGit.test.ts b/src/test/hunkwiseGit.test.ts
