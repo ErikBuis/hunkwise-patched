@@ -552,10 +552,10 @@ index 0a92f8b..b38d916 100644
    } finally {
      fileWatcher.clearSelfEdit(filePath);
 diff --git a/src/decorationManager.ts b/src/decorationManager.ts
-index e652a63..74c1f7c 100644
+index e652a63..7b2b737 100644
 --- a/src/decorationManager.ts
 +++ b/src/decorationManager.ts
-@@ -1,91 +1,57 @@
+@@ -1,91 +1,53 @@
  import * as vscode from 'vscode';
  import { StateManager } from './stateManager';
 -import { computeHunks, hunkId } from './diffEngine';
@@ -679,15 +679,11 @@ index e652a63..74c1f7c 100644
 -</body></html>`;
 +function rightEdgeFor(editor: vscode.TextEditor): RightEdge {
 +  const config = vscode.workspace.getConfiguration('editor', editor.document);
-+  const minimapOnRight = config.get<boolean>('minimap.enabled', true) && config.get<string>('minimap.side', 'right') === 'right';
-+  return {
-+    scrollbarWidth: config.get<number>('scrollbar.verticalScrollbarSize', 14),
-+    minimap: minimapOnRight ? { maxColumn: config.get<number>('minimap.maxColumn', 120), scale: config.get<number>('minimap.scale', 1) } : undefined,
-+  };
++  return { scrollbarWidth: config.get<number>('scrollbar.verticalScrollbarSize', 14) };
  }
  
  interface HunkInset {
-@@ -94,9 +60,17 @@ interface HunkInset {
+@@ -94,9 +56,17 @@ interface HunkInset {
    disposeListener: vscode.Disposable;
    // Cache key: used to detect whether this inset can be reused
    cacheKey: string;
@@ -705,7 +701,7 @@ index e652a63..74c1f7c 100644
  function insetCacheKey(afterLine: number, height: number): string {
    return `${afterLine}:${height}`;
  }
-@@ -104,11 +78,14 @@ function insetCacheKey(afterLine: number, height: number): string {
+@@ -104,11 +74,14 @@ function insetCacheKey(afterLine: number, height: number): string {
  export class DecorationManager {
    // editorKey → ordered list of insets for that editor
    private insets: Map<string, HunkInset[]> = new Map();
@@ -722,7 +718,7 @@ index e652a63..74c1f7c 100644
    ) {
      this.onAction = onAction;
    }
-@@ -121,6 +98,28 @@ export class DecorationManager {
+@@ -121,6 +94,28 @@ export class DecorationManager {
      }
    }
  
@@ -751,7 +747,7 @@ index e652a63..74c1f7c 100644
    refreshActionBar(_editor: vscode.TextEditor): void { /* buttons live in insets */ }
  
    private disposeInsetList(list: HunkInset[]): void {
-@@ -150,6 +149,11 @@ export class DecorationManager {
+@@ -150,6 +145,11 @@ export class DecorationManager {
      const filePath = editor.document.uri.fsPath;
      const editorKey = editor.document.uri.toString();
      const fileState = this.stateManager.getFile(filePath);
@@ -763,7 +759,7 @@ index e652a63..74c1f7c 100644
  
      // Skip insets: in diff editors (viewColumn undefined), or when user disabled inline decorations
      const isInDiff = editor.viewColumn === undefined && diffPaths.has(filePath);
-@@ -158,12 +162,13 @@ export class DecorationManager {
+@@ -158,12 +158,13 @@ export class DecorationManager {
      if (!fileState || fileState.status !== 'reviewing' || skipInsets) {
        this.disposeInsetList(this.insets.get(editorKey) ?? []);
        this.insets.delete(editorKey);
@@ -779,7 +775,7 @@ index e652a63..74c1f7c 100644
      const parsed = computeHunks(fileState.baseline, editor.document.getText());
  
      // Build the desired inset specs first
-@@ -171,79 +176,32 @@ export class DecorationManager {
+@@ -171,79 +172,32 @@ export class DecorationManager {
        afterLine: number;
        height: number;
        html: string;
@@ -877,7 +873,7 @@ index e652a63..74c1f7c 100644
      // Reuse existing insets when cache keys match to avoid flicker
      const existing = this.insets.get(editorKey) ?? [];
      const nextInsets: HunkInset[] = [];
-@@ -253,13 +211,17 @@ export class DecorationManager {
+@@ -253,13 +207,17 @@ export class DecorationManager {
        const key = insetCacheKey(spec.afterLine, spec.height);
        const prev = existing[i];
        if (prev && prev.cacheKey === key && !prev.disposed) {
@@ -898,7 +894,7 @@ index e652a63..74c1f7c 100644
          if (created) nextInsets.push(created);
        }
      }
-@@ -273,7 +235,7 @@ export class DecorationManager {
+@@ -273,7 +231,7 @@ export class DecorationManager {
        }
      }
  
@@ -907,7 +903,7 @@ index e652a63..74c1f7c 100644
      if (nextInsets.length > 0) {
        this.insets.set(editorKey, nextInsets);
      } else {
-@@ -288,6 +250,7 @@ export class DecorationManager {
+@@ -288,6 +246,7 @@ export class DecorationManager {
      height: number,
      html: string,
      cacheKey: string,
@@ -915,7 +911,7 @@ index e652a63..74c1f7c 100644
    ): HunkInset | undefined {
      try {
        const inset = (vscode.window as any).createWebviewTextEditorInset(
-@@ -296,11 +259,16 @@ export class DecorationManager {
+@@ -296,11 +255,16 @@ export class DecorationManager {
        inset.webview.html = html;
        const disposable = inset.webview.onDidReceiveMessage((msg: any) => {
          if (msg.command === 'accept' || msg.command === 'discard') {
@@ -934,7 +930,7 @@ index e652a63..74c1f7c 100644
          disposeListener: inset.onDidDispose(() => {
            entry.disposed = true;
            // Re-apply if editor is still visible so insets are immediately rebuilt
-@@ -318,7 +286,10 @@ export class DecorationManager {
+@@ -318,7 +282,10 @@ export class DecorationManager {
    }
  
    dispose(): void {
@@ -1916,10 +1912,10 @@ index f1ef23e..ca3f830 100644
 +}
 diff --git a/src/hunkInsetHtml.ts b/src/hunkInsetHtml.ts
 new file mode 100644
-index 0000000..a9c42f1
+index 0000000..7c27a4a
 --- /dev/null
 +++ b/src/hunkInsetHtml.ts
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,126 @@
 +// HTML of the inset hunkwise shows above each hunk. Kept free of the vscode API so it can be unit tested.
 +import type { LineRange } from './diffEngine';
 +
@@ -1953,20 +1949,13 @@ index 0000000..a9c42f1
 +// An inset's height is a whole number of editor lines, set when it is created. The webview
 +// derives the editor's line height from its own height, and reports back how many lines it
 +// really needs (removed lines can wrap), so the inset is recreated at that height.
-+//
-+// An inset is as wide as the editor's longest line has ever been (VS Code doesn't shrink it right
-+// away when the editor gets narrower), so its right edge can be far outside the editor. The
-+// webview therefore finds out which part of it is actually visible (an IntersectionObserver
-+// reports that, clipped by the editor) and keeps the buttons at the right of that part, clear of
-+// the minimap and the scrollbar.
 +
 +/** How the removed lines wrap: not at all, at the editor width, or at a column. */
 +export type WrapMode = { kind: 'off' } | { kind: 'width' } | { kind: 'column'; column: number };
 +
-+/** What covers the right side of the editor: its vertical scrollbar and (if on the right) the minimap. */
++/** What covers the right side of the editor. */
 +export interface RightEdge {
 +  scrollbarWidth: number;
-+  minimap?: { maxColumn: number; scale: number };
 +}
 +
 +/**
@@ -2004,8 +1993,6 @@ index 0000000..a9c42f1
 +  line-height: var(--lh);
 +}
 +#content { position: relative; min-height: var(--lh); }
-+/* A full-width strip whose visible part tells where the editor's right edge is. */
-+#probe { position: absolute; top: 0; left: 0; right: 0; height: 1px; pointer-events: none; }
 +.bar {
 +  position: absolute; top: 0; right: 0; z-index: 1;
 +  height: var(--lh);
@@ -2030,7 +2017,6 @@ index 0000000..a9c42f1
 +</style>
 +</head><body>
 +<div id="content">
-+<div id="probe"></div>
 +<div class="bar" id="bar">
 +<button class="btn-accept" title="Accept this change" onclick="send(${escapeHtml(message('accept'))})">✓ Accept</button>
 +<button class="btn-discard" title="Discard this change" onclick="send(${escapeHtml(message('discard'))})">↺ Discard</button>
@@ -2043,34 +2029,8 @@ index 0000000..a9c42f1
 +const RIGHT_EDGE = ${JSON.stringify(rightEdge)};
 +function send(msg) { vscode.postMessage(msg); }
 +
-+// Width covered by the scrollbar and minimap, the way VS Code computes the minimap's maximum width.
-+function coveredWidth() {
-+  let width = RIGHT_EDGE.scrollbarWidth + 6;
-+  if (RIGHT_EDGE.minimap) {
-+    const ratio = window.devicePixelRatio || 1;
-+    const scale = ratio >= 2 ? Math.round(RIGHT_EDGE.minimap.scale * 2) : RIGHT_EDGE.minimap.scale;
-+    width += Math.floor(RIGHT_EDGE.minimap.maxColumn * scale / ratio) + 8;
-+  }
-+  return width;
-+}
-+const bar = document.getElementById('bar');
-+let visibleRight = window.innerWidth;
-+function placeBar() {
-+  bar.style.right = Math.max(0, window.innerWidth - visibleRight + coveredWidth()) + 'px';
-+}
-+placeBar();
-+if (typeof IntersectionObserver === 'function') {
-+  const thresholds = Array.from({ length: 501 }, (_, i) => i / 500);
-+  new IntersectionObserver(entries => {
-+    for (const entry of entries) {
-+      if (entry.isIntersecting && entry.intersectionRect.width > 0) {
-+        visibleRight = Math.min(window.innerWidth, entry.intersectionRect.right);
-+        placeBar();
-+      }
-+    }
-+  }, { threshold: thresholds }).observe(document.getElementById('probe'));
-+}
-+window.addEventListener('resize', placeBar);
++// Keep the buttons clear of the editor's vertical scrollbar.
++document.getElementById('bar').style.right = (RIGHT_EDGE.scrollbarWidth + 4) + 'px';
 +function measure() {
 +  const lineHeight = window.innerHeight / HEIGHT_LINES;
 +  if (!lineHeight) return;
@@ -2642,7 +2602,7 @@ index 0000000..360b0b8
 +});
 diff --git a/src/test/hunkInsetHtml.test.ts b/src/test/hunkInsetHtml.test.ts
 new file mode 100644
-index 0000000..31144d0
+index 0000000..4b7a652
 --- /dev/null
 +++ b/src/test/hunkInsetHtml.test.ts
 @@ -0,0 +1,60 @@
@@ -2659,7 +2619,7 @@ index 0000000..31144d0
 +  return [...html.matchAll(/onclick="([^"]*)"/g)].map(m => unescapeHtml(m[1]));
 +}
 +
-+const EDGE = { scrollbarWidth: 14, minimap: { maxColumn: 120, scale: 1 } };
++const EDGE = { scrollbarWidth: 14 };
 +
 +describe('buildHunkHtml', () => {
 +  const filePath = 'C:\\Users\\me\\"quoted" <dir>\\file.ts';

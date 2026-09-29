@@ -29,7 +29,7 @@ Everything else, like your own typing, a Black formatting run, or a Git discard,
 
 ## Reviewing
 - Removed lines are shown in red above the hunk, and wrap just like the rest of the editor does. Within a hunk, the exact words that changed get a darker highlight, in the same colors as VS Code's own diffs.
-- Every hunk has its **Accept** and **Discard** buttons hovering over the top right of its removed lines, always at the right edge of the editor (even when you make it narrower). After you click one, the editor scrolls to the next hunk and puts its buttons in exactly the same spot, so you can click through a file without moving your mouse. A hunk that only adds lines has nothing to hover over, so its buttons get a line of their own above it, since VS Code doesn't let extensions draw over the editor's text.
+- Every hunk has its **Accept** and **Discard** buttons hovering over the top right of its removed lines. After you click one, the editor scrolls to the next hunk and puts its buttons in exactly the same spot, so you can click through a file without moving your mouse. A hunk that only adds lines has nothing to hover over, so its buttons get a line of their own above it, since VS Code doesn't let extensions draw over the editor's text.
 - To accept or discard all changes in a file (or all files) at once, use the hunkwise panel. The editor title bar also has buttons for the file you're looking at, plus arrows to jump to the previous or next hunk.
 - Files with hunks to review get a purple ✦ badge in the Explorer, and so do the folders they're in, so you can see what Claude changed without opening the hunkwise panel.
 
