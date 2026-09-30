@@ -28,7 +28,7 @@ Only changes Claude makes with its file tools: `Edit`, `Write` (including new fi
 Everything else, like your own typing, a Black formatting run, or a Git discard, is accepted without a hunk. The one exception is when you edit lines inside a Claude hunk: your edit then becomes part of that hunk (as if Claude wrote it), and the hunk stays until you accept or discard it.
 
 ## Reviewing
-- Removed lines are shown in red above the hunk, and wrap just like the rest of the editor does. Within a hunk, the exact words that changed get a darker highlight, in the same colors as VS Code's own diffs.
+- Removed lines are shown in red above the hunk, and wrap just like the rest of the editor does. Within a hunk, the exact words that changed get a darker highlight, in the same colors as VS Code's own diffs. Scrolling with the mouse wheel works over them too, just like over the rest of the editor.
 - Every hunk has its **Accept** and **Discard** buttons hovering over the top right of its removed lines. After you click one, the editor scrolls to the next hunk and puts its buttons in exactly the same spot, so you can click through a file without moving your mouse. A hunk that only adds lines has nothing to hover over, so its buttons get a line of their own above it, since VS Code doesn't let extensions draw over the editor's text.
 - To accept or discard all changes in a file (or all files) at once, use the hunkwise panel. The editor title bar also has buttons for the file you're looking at, plus arrows to jump to the previous or next hunk.
 - Files with hunks to review get a purple ✦ badge in the Explorer, and so do the folders they're in, so you can see what Claude changed without opening the hunkwise panel.

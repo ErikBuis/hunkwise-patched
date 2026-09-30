@@ -552,11 +552,12 @@ index 0a92f8b..b38d916 100644
    } finally {
      fileWatcher.clearSelfEdit(filePath);
 diff --git a/src/decorationManager.ts b/src/decorationManager.ts
-index e652a63..7b2b737 100644
+index e652a63..2e80672 100644
 --- a/src/decorationManager.ts
 +++ b/src/decorationManager.ts
-@@ -1,91 +1,53 @@
+@@ -1,91 +1,85 @@
  import * as vscode from 'vscode';
++import * as path from 'path';
  import { StateManager } from './stateManager';
 -import { computeHunks, hunkId } from './diffEngine';
 +import { changedRanges, computeHunks, hunkId, ParsedHunk } from './diffEngine';
@@ -663,7 +664,14 @@ index e652a63..7b2b737 100644
 -  background: rgba(248,81,73,0.08);
 -  color: #c97d7a;
 -  border-color: rgba(248,81,73,0.25);
--}
++function rightEdgeFor(editor: vscode.TextEditor): RightEdge {
++  const config = vscode.workspace.getConfiguration('editor', editor.document);
++  const minimapOnRight = config.get<boolean>('minimap.enabled', true) && config.get<string>('minimap.side', 'right') === 'right';
++  return {
++    scrollbarWidth: config.get<number>('scrollbar.verticalScrollbarSize', 14),
++    minimap: minimapOnRight ? { maxColumn: config.get<number>('minimap.maxColumn', 120), scale: config.get<number>('minimap.scale', 1) } : undefined,
++  };
+ }
 -.btn-discard:hover { background: rgba(248,81,73,0.15); }
 -</style>
 -</head><body>
@@ -677,13 +685,36 @@ index e652a63..7b2b737 100644
 -function discard() { vscode.postMessage({ command: 'discard', filePath: ${JSON.stringify(filePath)}, hunkId: ${JSON.stringify(hunkId)} }); }
 -</script>
 -</body></html>`;
-+function rightEdgeFor(editor: vscode.TextEditor): RightEdge {
++
++/**
++ * Scroll an editor for the mouse wheel events over one of its insets, which the editor doesn't
++ * get itself. lines and columns may be fractions: editorScroll only moves whole ones, so the
++ * rest is kept in remainder for the next event.
++ */
++function scrollEditor(editor: vscode.TextEditor, remainder: { lines: number; columns: number }, lines: number, columns: number, fast: boolean): void {
 +  const config = vscode.workspace.getConfiguration('editor', editor.document);
-+  return { scrollbarWidth: config.get<number>('scrollbar.verticalScrollbarSize', 14) };
++  const factor = config.get<number>('mouseWheelScrollSensitivity', 1) * (fast ? config.get<number>('fastScrollSensitivity', 5) : 1);
++  remainder.lines += lines * factor;
++  remainder.columns += columns * factor;
++  const wholeLines = Math.trunc(remainder.lines);
++  const wholeColumns = Math.trunc(remainder.columns);
++  remainder.lines -= wholeLines;
++  remainder.columns -= wholeColumns;
++
++  if (editor === vscode.window.activeTextEditor) {
++    // Scrolls by the editor's line height, so it also moves smoothly past wrapped lines and insets.
++    if (wholeLines) void vscode.commands.executeCommand('editorScroll', { to: wholeLines > 0 ? 'down' : 'up', by: 'wrappedLine', value: Math.abs(wholeLines) });
++    if (wholeColumns) void vscode.commands.executeCommand('editorScroll', { to: wholeColumns > 0 ? 'right' : 'left', by: 'column', value: Math.abs(wholeColumns) });
++  } else if (wholeLines && editor.visibleRanges.length > 0) {
++    // editorScroll only works on the active editor, so fall back to scrolling by whole lines.
++    const lastLine = editor.document.lineCount - 1;
++    const top = Math.min(lastLine, Math.max(0, editor.visibleRanges[0].start.line + wholeLines));
++    editor.revealRange(new vscode.Range(top, 0, top, 0), vscode.TextEditorRevealType.AtTop);
++  }
  }
  
  interface HunkInset {
-@@ -94,9 +56,17 @@ interface HunkInset {
+@@ -94,9 +88,17 @@ interface HunkInset {
    disposeListener: vscode.Disposable;
    // Cache key: used to detect whether this inset can be reused
    cacheKey: string;
@@ -701,7 +732,7 @@ index e652a63..7b2b737 100644
  function insetCacheKey(afterLine: number, height: number): string {
    return `${afterLine}:${height}`;
  }
-@@ -104,11 +74,14 @@ function insetCacheKey(afterLine: number, height: number): string {
+@@ -104,11 +106,16 @@ function insetCacheKey(afterLine: number, height: number): string {
  export class DecorationManager {
    // editorKey → ordered list of insets for that editor
    private insets: Map<string, HunkInset[]> = new Map();
@@ -709,6 +740,8 @@ index e652a63..7b2b737 100644
 +  private insetTimers: Map<string, NodeJS.Timeout> = new Map();
 +  // Height in lines that a hunk's inset reported it needs, by editor, wrap settings and content.
 +  private measuredHeights: Map<string, number> = new Map();
++  // editorKey → the part of a wheel scroll that didn't add up to a whole line or column yet
++  private scrollRemainders: Map<string, { lines: number; columns: number }> = new Map();
 +  private onAction: ((command: 'accept' | 'discard', filePath: string, hunkId: string, editorKey: string) => void) | undefined;
  
    constructor(
@@ -718,7 +751,7 @@ index e652a63..7b2b737 100644
    ) {
      this.onAction = onAction;
    }
-@@ -121,6 +94,28 @@ export class DecorationManager {
+@@ -121,6 +128,28 @@ export class DecorationManager {
      }
    }
  
@@ -747,7 +780,7 @@ index e652a63..7b2b737 100644
    refreshActionBar(_editor: vscode.TextEditor): void { /* buttons live in insets */ }
  
    private disposeInsetList(list: HunkInset[]): void {
-@@ -150,6 +145,11 @@ export class DecorationManager {
+@@ -150,6 +179,11 @@ export class DecorationManager {
      const filePath = editor.document.uri.fsPath;
      const editorKey = editor.document.uri.toString();
      const fileState = this.stateManager.getFile(filePath);
@@ -759,7 +792,7 @@ index e652a63..7b2b737 100644
  
      // Skip insets: in diff editors (viewColumn undefined), or when user disabled inline decorations
      const isInDiff = editor.viewColumn === undefined && diffPaths.has(filePath);
-@@ -158,12 +158,13 @@ export class DecorationManager {
+@@ -158,12 +192,13 @@ export class DecorationManager {
      if (!fileState || fileState.status !== 'reviewing' || skipInsets) {
        this.disposeInsetList(this.insets.get(editorKey) ?? []);
        this.insets.delete(editorKey);
@@ -775,7 +808,7 @@ index e652a63..7b2b737 100644
      const parsed = computeHunks(fileState.baseline, editor.document.getText());
  
      // Build the desired inset specs first
-@@ -171,79 +172,32 @@ export class DecorationManager {
+@@ -171,79 +206,32 @@ export class DecorationManager {
        afterLine: number;
        height: number;
        html: string;
@@ -873,7 +906,7 @@ index e652a63..7b2b737 100644
      // Reuse existing insets when cache keys match to avoid flicker
      const existing = this.insets.get(editorKey) ?? [];
      const nextInsets: HunkInset[] = [];
-@@ -253,13 +207,17 @@ export class DecorationManager {
+@@ -253,13 +241,17 @@ export class DecorationManager {
        const key = insetCacheKey(spec.afterLine, spec.height);
        const prev = existing[i];
        if (prev && prev.cacheKey === key && !prev.disposed) {
@@ -894,7 +927,7 @@ index e652a63..7b2b737 100644
          if (created) nextInsets.push(created);
        }
      }
-@@ -273,7 +231,7 @@ export class DecorationManager {
+@@ -273,7 +265,7 @@ export class DecorationManager {
        }
      }
  
@@ -903,7 +936,7 @@ index e652a63..7b2b737 100644
      if (nextInsets.length > 0) {
        this.insets.set(editorKey, nextInsets);
      } else {
-@@ -288,6 +246,7 @@ export class DecorationManager {
+@@ -288,6 +280,7 @@ export class DecorationManager {
      height: number,
      html: string,
      cacheKey: string,
@@ -911,7 +944,7 @@ index e652a63..7b2b737 100644
    ): HunkInset | undefined {
      try {
        const inset = (vscode.window as any).createWebviewTextEditorInset(
-@@ -296,11 +255,16 @@ export class DecorationManager {
+@@ -296,11 +289,24 @@ export class DecorationManager {
        inset.webview.html = html;
        const disposable = inset.webview.onDidReceiveMessage((msg: any) => {
          if (msg.command === 'accept' || msg.command === 'discard') {
@@ -922,6 +955,14 @@ index e652a63..7b2b737 100644
 +          this.measuredHeights.set(entry.measureKey, msg.lines);
 +          const target = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === editorKey);
 +          if (target) this.applyToEditor(target, this.diffEditorFilePaths());
++        } else if (msg.command === 'scroll' && Number.isFinite(msg.lines) && Number.isFinite(msg.columns)) {
++          const target = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === editorKey);
++          if (!target) return;
++          let remainder = this.scrollRemainders.get(editorKey);
++          if (!remainder) this.scrollRemainders.set(editorKey, remainder = { lines: 0, columns: 0 });
++          scrollEditor(target, remainder, msg.lines, msg.columns, !!msg.fast);
++        } else if (msg.command === 'cutOff') {
++          log(`inset of ${path.basename(editor.document.uri.fsPath)} after line ${afterLine + 1}: ${msg.cutOff}px of its ${msg.width}px are outside the editor, moved the buttons left`);
          }
        });
        const entry: HunkInset = {
@@ -930,7 +971,7 @@ index e652a63..7b2b737 100644
          disposeListener: inset.onDidDispose(() => {
            entry.disposed = true;
            // Re-apply if editor is still visible so insets are immediately rebuilt
-@@ -318,7 +282,10 @@ export class DecorationManager {
+@@ -318,7 +324,10 @@ export class DecorationManager {
    }
  
    dispose(): void {
@@ -1912,10 +1953,10 @@ index f1ef23e..ca3f830 100644
 +}
 diff --git a/src/hunkInsetHtml.ts b/src/hunkInsetHtml.ts
 new file mode 100644
-index 0000000..7c27a4a
+index 0000000..f8e16cf
 --- /dev/null
 +++ b/src/hunkInsetHtml.ts
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,214 @@
 +// HTML of the inset hunkwise shows above each hunk. Kept free of the vscode API so it can be unit tested.
 +import type { LineRange } from './diffEngine';
 +
@@ -1949,13 +1990,22 @@ index 0000000..7c27a4a
 +// An inset's height is a whole number of editor lines, set when it is created. The webview
 +// derives the editor's line height from its own height, and reports back how many lines it
 +// really needs (removed lines can wrap), so the inset is recreated at that height.
++//
++// An inset is as wide as the editor's content, which can be wider than the editor itself (with
++// word wrap off and long lines, VS Code makes it as wide as the longest line it has shown). Its
++// right part, buttons included, is then cut off. A probe along the top of the inset tells how
++// much is cut off, and only then do the buttons move left, clear of the minimap and scrollbar.
++// Otherwise they stay put, so they don't wiggle while the editor is resized.
++//
++// The editor doesn't get the mouse wheel events over an inset, so the webview passes them on.
 +
 +/** How the removed lines wrap: not at all, at the editor width, or at a column. */
 +export type WrapMode = { kind: 'off' } | { kind: 'width' } | { kind: 'column'; column: number };
 +
-+/** What covers the right side of the editor. */
++/** What covers the right side of the editor: its vertical scrollbar and (if on the right) the minimap. */
 +export interface RightEdge {
 +  scrollbarWidth: number;
++  minimap?: { maxColumn: number; scale: number };
 +}
 +
 +/**
@@ -1993,6 +2043,9 @@ index 0000000..7c27a4a
 +  line-height: var(--lh);
 +}
 +#content { position: relative; min-height: var(--lh); }
++/* A full-width strip whose visible part tells how much of the inset the editor cuts off. */
++#probe { position: absolute; top: 0; left: 0; right: 0; height: 1px; pointer-events: none; }
++#char { position: absolute; visibility: hidden; white-space: pre; }
 +.bar {
 +  position: absolute; top: 0; right: 0; z-index: 1;
 +  height: var(--lh);
@@ -2017,6 +2070,8 @@ index 0000000..7c27a4a
 +</style>
 +</head><body>
 +<div id="content">
++<div id="probe"></div>
++<span id="char">xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</span>
 +<div class="bar" id="bar">
 +<button class="btn-accept" title="Accept this change" onclick="send(${escapeHtml(message('accept'))})">✓ Accept</button>
 +<button class="btn-discard" title="Discard this change" onclick="send(${escapeHtml(message('discard'))})">↺ Discard</button>
@@ -2029,15 +2084,89 @@ index 0000000..7c27a4a
 +const RIGHT_EDGE = ${JSON.stringify(rightEdge)};
 +function send(msg) { vscode.postMessage(msg); }
 +
-+// Keep the buttons clear of the editor's vertical scrollbar.
-+document.getElementById('bar').style.right = (RIGHT_EDGE.scrollbarWidth + 4) + 'px';
++// Keep the buttons clear of the editor's vertical scrollbar, and move them left when the editor
++// cuts off the right part of the inset.
++const bar = document.getElementById('bar');
++const BASE_RIGHT = RIGHT_EDGE.scrollbarWidth + 4;
++bar.style.right = BASE_RIGHT + 'px';
++// Width of the scrollbar and minimap at the editor's right edge, the way VS Code computes the
++// minimap's maximum width.
++function coveredWidth() {
++  let width = RIGHT_EDGE.scrollbarWidth + 6;
++  if (RIGHT_EDGE.minimap) {
++    const ratio = window.devicePixelRatio || 1;
++    const scale = ratio >= 2 ? Math.round(RIGHT_EDGE.minimap.scale * 2) : RIGHT_EDGE.minimap.scale;
++    width += Math.floor(RIGHT_EDGE.minimap.maxColumn * scale / ratio) + 8;
++  }
++  return width;
++}
++let cutOff = 0;
++let placeTimer;
++let reported = false;
++function placeBar() {
++  const right = cutOff > 1 ? cutOff + coveredWidth() : BASE_RIGHT;
++  bar.style.right = Math.min(right, Math.max(BASE_RIGHT, window.innerWidth - bar.offsetWidth)) + 'px';
++  // Log it once when it lasts (it briefly happens while the editor gets narrower).
++  if (cutOff > 1 && !reported) {
++    setTimeout(() => {
++      if (cutOff <= 1 || reported) return;
++      reported = true;
++      send({ command: 'cutOff', width: window.innerWidth, cutOff: Math.round(cutOff) });
++    }, 1000);
++  }
++}
++if (typeof IntersectionObserver === 'function') {
++  const thresholds = Array.from({ length: 501 }, (_, i) => i / 500);
++  new IntersectionObserver(entries => {
++    for (const entry of entries) {
++      if (!entry.isIntersecting || entry.intersectionRect.width <= 0) continue;
++      cutOff = Math.max(0, window.innerWidth - entry.intersectionRect.right);
++      // Wait until the editor settles (e.g. while it is resized), so the buttons move only once.
++      clearTimeout(placeTimer);
++      placeTimer = setTimeout(placeBar, 100);
++    }
++  }, { threshold: thresholds }).observe(document.getElementById('probe'));
++}
++
++// Pass wheel events on to the editor, converted to lines and columns the way the editor itself
++// converts them (see VS Code's StandardWheelEvent: 50px per wheel unit), and sent at most once
++// per frame.
++const isMac = navigator.userAgent.includes('Mac');
++const pendingScroll = { lines: 0, columns: 0, fast: false };
++let scrollFrame = 0;
++function wheelPixels(wheelDelta, delta, mode) {
++  if (typeof wheelDelta === 'number') return -wheelDelta / 120 * 50;
++  return mode === 1 ? delta * 50 : delta / 40 * 50;
++}
++window.addEventListener('wheel', e => {
++  if (e.ctrlKey) return; // zooming
++  const lineHeight = window.innerHeight / HEIGHT_LINES;
++  const charWidth = document.getElementById('char').offsetWidth / 50;
++  if (!lineHeight || !charWidth) return;
++  let dy = wheelPixels(e.wheelDeltaY, e.deltaY, e.deltaMode);
++  let dx = wheelPixels(e.wheelDeltaX, e.deltaX, e.deltaMode);
++  if (Math.abs(dy) >= Math.abs(dx)) dx = 0; else dy = 0;
++  if (e.shiftKey && !isMac && !dx) { dx = dy; dy = 0; }
++  pendingScroll.lines += dy / lineHeight;
++  pendingScroll.columns += dx / charWidth;
++  pendingScroll.fast = e.altKey;
++  if (!scrollFrame) {
++    scrollFrame = requestAnimationFrame(() => {
++      scrollFrame = 0;
++      send({ command: 'scroll', lines: pendingScroll.lines, columns: pendingScroll.columns, fast: pendingScroll.fast });
++      pendingScroll.lines = 0;
++      pendingScroll.columns = 0;
++    });
++  }
++}, { passive: true });
++
 +function measure() {
 +  const lineHeight = window.innerHeight / HEIGHT_LINES;
 +  if (!lineHeight) return;
 +  const needed = Math.max(1, Math.round(document.getElementById('content').offsetHeight / lineHeight));
 +  if (needed !== HEIGHT_LINES) send({ command: 'resize', lines: needed });
 +}
-+window.addEventListener('resize', measure);
++window.addEventListener('resize', () => { measure(); placeBar(); });
 +measure();
 +</script>
 +</body></html>`;
@@ -2602,10 +2731,10 @@ index 0000000..360b0b8
 +});
 diff --git a/src/test/hunkInsetHtml.test.ts b/src/test/hunkInsetHtml.test.ts
 new file mode 100644
-index 0000000..4b7a652
+index 0000000..e32cdf6
 --- /dev/null
 +++ b/src/test/hunkInsetHtml.test.ts
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,62 @@
 +import { describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { buildHunkHtml } from '../hunkInsetHtml';
@@ -2625,13 +2754,15 @@ index 0000000..4b7a652
 +  const filePath = 'C:\\Users\\me\\"quoted" <dir>\\file.ts';
 +
 +  it('produces a script and click handlers that parse', () => {
-+    const html = buildHunkHtml(filePath, '3:1:3:1', ['old line'], [], 4, 2, { kind: 'width' }, EDGE);
-+    const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
-+    assert.ok(script);
-+    assert.doesNotThrow(() => new Function(script));
-+    const handlers = onclickHandlers(html);
-+    assert.equal(handlers.length, 2);
-+    for (const handler of handlers) assert.doesNotThrow(() => new Function('send', handler));
++    for (const edge of [EDGE, { scrollbarWidth: 10, minimap: { maxColumn: 120, scale: 2 } }]) {
++      const html = buildHunkHtml(filePath, '3:1:3:1', ['old line'], [], 4, 2, { kind: 'width' }, edge);
++      const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
++      assert.ok(script);
++      assert.doesNotThrow(() => new Function(script));
++      const handlers = onclickHandlers(html);
++      assert.equal(handlers.length, 2);
++      for (const handler of handlers) assert.doesNotThrow(() => new Function('send', handler));
++    }
 +  });
 +
 +  it('sends the file path and hunk id unchanged', () => {
