@@ -9,8 +9,13 @@ This build flips that around, so hunkwise only shows the changes it knows Claude
 
 ### Windows
 1. Clone this repo anywhere.
-2. Double-click `install.cmd`.
+2. Open a PowerShell terminal in the cloned folder and run `./install.ps1`.
 3. Fully quit VS Code (all windows, not just the one you're in) and reopen it.
+
+If PowerShell says that running scripts is disabled on this system, Windows PowerShell's default execution policy is blocking the script. Run it like this instead:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
 
 ### Linux and macOS
 1. Clone this repo anywhere.
@@ -49,7 +54,6 @@ To turn it off for one folder, go to the hunkwise panel > gear icon > **Disable*
 | File | Purpose |
 | --- | --- |
 | `hunkwise-0.0.29.vsix` | The pre-built extension, based on molon/hunkwise commit `d609507`. |
-| `install.cmd` | The thing you double-click. It just starts `install.ps1` with the right PowerShell flags. |
 | `install.ps1` | Does the actual work on Windows: installs the `.vsix` into every VS Code build it finds, adds `"enable-proposed-api": ["molon.hunkwise"]` to `argv.json` (hunkwise needs an API that VS Code only enables this way), and registers the Claude Code hooks. Running it again is safe, since it never adds anything twice. |
 | `install.sh` | The same as `install.ps1`, but for Linux, macOS and dev containers (inside a container, it leaves `argv.json` alone). |
 | `hunkwise-auto-enable.patch` | All source changes compared to upstream hunkwise. You only need this if you want to rebuild a newer hunkwise version with the same changes. |

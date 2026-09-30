@@ -1,7 +1,7 @@
 # Installs the patched hunkwise extension (auto-enable, no per-folder files, Windows subfolder fix,
 # only Claude Code's own edits become hunks) into every VS Code build found on this PC, enables the
 # proposed API it needs, and registers the Claude Code hooks that tell hunkwise what Claude edits.
-# Run: double-click install.cmd.
+# Run: ./install.ps1 from a PowerShell terminal in this folder.
 
 param(
     [string]$TestArgv,           # Only used for testing the argv.json update on a copy.
@@ -73,13 +73,13 @@ function Update-ClaudeSettings([string]$Path) {
         if ($groups.Count -gt 0) { $hooks.($prop.Name) = $groups } else { $hooks.PSObject.Properties.Remove($prop.Name) }
     }
 
-    foreach ($event in $HookEvents) {
+    foreach ($hookEvent in $HookEvents) {
         $entry = [pscustomobject][ordered]@{ type = 'http'; url = $HookUrl; timeout = 5 }
         $group = [pscustomobject][ordered]@{ matcher = $HookMatcher; hooks = @($entry) }
-        if ($hooks.PSObject.Properties[$event]) {
-            $hooks.$event = @(@($hooks.$event) + $group)
+        if ($hooks.PSObject.Properties[$hookEvent]) {
+            $hooks.$hookEvent = @(@($hooks.$hookEvent) + $group)
         } else {
-            $hooks | Add-Member -NotePropertyName $event -NotePropertyValue @($group)
+            $hooks | Add-Member -NotePropertyName $hookEvent -NotePropertyValue @($group)
         }
     }
 
