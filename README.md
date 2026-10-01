@@ -47,6 +47,8 @@ Everything else, like your own typing, a Black formatting run, or a Git discard,
 ## How it works (for nerds)
 To know what Claude edits, hunkwise runs a tiny local server on `127.0.0.1:47821` and Claude Code calls it right before and after every Edit/Write/NotebookEdit. The install script registers these hooks in `~/.claude/settings.json`, and your other settings and hooks stay untouched. If VS Code isn't running, the hooks just find nothing listening and Claude Code carries on normally.
 
+The original hunkwise copies every file in your workspace into a private git repo when you turn it on, so it has something to compare against when any file changes. This build doesn't need that, since the hooks tell it what a file looked like right before Claude changed it. So it only stores the files that are under review, and drops each one again once you've accepted or discarded all its hunks. Turning it on in a big repo costs nothing, and a leftover copy from an older version is cleaned up the next time VS Code starts.
+
 ## Turning it off
 To turn it off for one folder, go to the hunkwise panel > gear icon > **Disable**. It stays off in that folder until you click **Enable** again.
 
