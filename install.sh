@@ -134,7 +134,8 @@ fi
 for build in "${builds[@]}"; do
   IFS='|' read -r name cli argv <<<"$build"
   echo "Installing into $name..."
-  "$cli" --install-extension "$vsix" --force
+  # VS Code's own CLI prints a Node.js deprecation warning (url.parse()) that has nothing to do with hunkwise.
+  NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--no-deprecation" "$cli" --install-extension "$vsix" --force
   if [ -n "$argv" ]; then update_argv "$argv"; fi
 done
 

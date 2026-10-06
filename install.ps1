@@ -138,7 +138,11 @@ $argvDone = @{}
 foreach ($b in $builds) {
     if (-not (Test-Path $b.Cli)) { continue }
     Write-Host "Installing into $($b.Name)..."
-    & $b.Cli --install-extension $vsix.FullName --force
+    # VS Code's own CLI prints a Node.js deprecation warning (url.parse()) that has nothing to do with hunkwise.
+    $nodeOptions = $env:NODE_OPTIONS
+    $env:NODE_OPTIONS = "$nodeOptions --no-deprecation".Trim()
+    try { & $b.Cli --install-extension $vsix.FullName --force }
+    finally { $env:NODE_OPTIONS = $nodeOptions }
     $installed++
     if (-not $argvDone[$b.Argv]) {
         Update-Argv $b.Argv
