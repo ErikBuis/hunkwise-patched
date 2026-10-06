@@ -1,8 +1,8 @@
 diff --git a/CLAUDE.md b/CLAUDE.md
-index c6abe86..0fb3a47 100644
+index c6abe86..4092b93 100644
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
-@@ -45,12 +45,12 @@ hunkwise is a VSCode extension that provides per-hunk Accept/Discard controls fo
+@@ -45,17 +45,18 @@ hunkwise is a VSCode extension that provides per-hunk Accept/Discard controls fo
  
  - **Self-edit suppression**: Before programmatically writing a file (discard/accept), `fileWatcher.markSelfEdit(filePath)` is called so the watcher ignores the resulting disk event.
  - **Baseline update on accept hunk**: Accepting a single hunk splices the accepted lines into `fileState.baseline` so subsequent diffs remain correct.
@@ -10,7 +10,8 @@ index c6abe86..0fb3a47 100644
 +- **Baseline as the single source of truth**: Whether a file is "new" or "existing" is determined solely by whether it has a baseline in hunkwise git — not by file content, encoding, or binary detection. `baseline === null` means new file (not tracked in git); `baseline === ''` means existing empty file; `baseline === <string>` means existing file with content. This distinction must be consistent across all code paths. Only files under review have a baseline in git; new files under review (`baseline === null`) are restored on load from the saved review state by `FileWatcher.reconcileUnattributed()`.
  - **Deleted file support**: If a file is externally deleted, its baseline is preserved and shown in a diff view via the `hunkwise-baseline:` content provider.
 -- **Persistence across restarts**: On `activate()`, `StateManager.load()` checks if `.vscode/hunkwise/git/` exists (enabled state), then reads all baselines from `git ls-tree HEAD` + `git show :path`. Files on disk that are not tracked in hunkwise git are detected as new files (`baseline: null`) via `collectUntrackedFiles()`.
-+- **Persistence across restarts**: On `activate()`, `StateManager.load()` checks if `.vscode/hunkwise/git/` exists (enabled state), then reads all baselines from `git ls-tree HEAD` + `git show :path`. Baselines of files whose content matches the disk (no longer under review) are removed from git.
++- **Persistence across restarts**: On `activate()`, `StateManager.load()` checks if `.vscode/hunkwise/git/` exists (enabled state), then reads all baselines from `git ls-tree HEAD` and one `git cat-file --batch` process (`HunkwiseGit.getBaselines()`). Baselines of files whose content matches the disk (no longer under review) are removed from git.
++- **Never block the extension host**: hunkwise shares its extension host (one Node.js event loop) with every other extension, Claude Code included. Starting a child process blocks it for 10-20 ms on Windows, so never start one per file (batch the git work, see `getBaselines()`, `removeFileBatch()` and `removeBaselines()`). Walk the file system asynchronously (see `FileWatcher.loadGitignore()`), skip work for files that are not under review, and keep diffs bounded: `computeHunks()`, `rebaseBaseline()` and `changedRanges()` give up after a time limit and fall back to coarser results.
  - **Rename/delete handling**: `onWillRenameFiles` migrates state+git before the actual rename; `onDidRenameFiles` triggers UI refresh after. Manual deletes (via VSCode) silently remove the baseline; external deletes produce a deletion hunk.
 -- **Git queue serialization**: All git write operations (`snapshot`, `removeFile`, `renameFile`, `snapshotBatch`) go through `StateManager.gitQueue` to prevent concurrent index/commit operations. Use `stateManager.snapshotFile()` from FileWatcher, never call `git.snapshot()` directly.
 -- **syncIgnoreState**: When `.gitignore` or `ignorePatterns` change, `syncIgnoreState()` both adds newly-allowed files and removes newly-ignored files from the git repo. It awaits the full `gitQueue` before returning.
@@ -19,6 +20,12 @@ index c6abe86..0fb3a47 100644
  - **`--force-remove` for git index**: `git update-index --remove` only removes files missing from disk — use `--force-remove` to unconditionally remove from the index even if the file exists on disk.
  
  ### Files that can be tested without VSCode
+ 
+-`tsconfig.test.json` compiles only `diffEngine.ts`, `hunkwiseGit.ts`, `gitignoreManager.ts`, and the test files — these have no `vscode` dependency and run in plain Node.
++`tsconfig.test.json` compiles the test files and the modules they use, which run in plain Node. `diffEngine.ts` and `hunkwiseGit.ts` have no `vscode` dependency; the others (`gitignoreManager.ts`, `claudeHooks.ts` through `log.ts`, `stateManager.ts` and `fileWatcher.ts`) run against the minimal stub in `src/test/__mocks__/vscode.ts`, which `npm test` installs as `out-test/node_modules/vscode`.
+ 
+ ### Integration tests
+ 
 diff --git a/README.md b/README.md
 index dc122e2..3383687 100644
 --- a/README.md
@@ -222,7 +229,7 @@ index 8ae8760..b20c78e 100644
 +}
 diff --git a/src/claudeHooks.ts b/src/claudeHooks.ts
 new file mode 100644
-index 0000000..a11c6a4
+index 0000000..3b8aabd
 --- /dev/null
 +++ b/src/claudeHooks.ts
 @@ -0,0 +1,299 @@
@@ -231,6 +238,7 @@ index 0000000..a11c6a4
 +import * as os from 'os';
 +import * as path from 'path';
 +import { log } from './log';
++import { MAX_FILE_BYTES } from './types';
 +
 +// Claude Code sends its hook events here (see install.ps1, which registers these hooks).
 +export const HOOK_PORT = 47821;
@@ -241,7 +249,6 @@ index 0000000..a11c6a4
 +const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 +
 +const MAX_BODY_BYTES = 64 * 1024 * 1024;
-+const MAX_FILE_BYTES = 20 * 1024 * 1024;
 +const LEADER_RETRY_MS = 3000;
 +const EVENT_TTL_MS = 15 * 60 * 1000;
 +const PRUNE_INTERVAL_MS = 60 * 1000;
@@ -526,7 +533,7 @@ index 0000000..a11c6a4
 +  }
 +}
 diff --git a/src/commands.ts b/src/commands.ts
-index 0a92f8b..70da5a4 100644
+index 0a92f8b..0590840 100644
 --- a/src/commands.ts
 +++ b/src/commands.ts
 @@ -7,6 +7,10 @@ import { ReviewPanel } from './reviewPanel';
@@ -601,7 +608,17 @@ index 0a92f8b..70da5a4 100644
    }
    onStateChanged();
  }
-@@ -216,12 +222,13 @@ export function acceptHunk(
+@@ -200,7 +206,8 @@ export function acceptHunk(
+   const hunks = computeHunks(fileState.baseline, doc.getText());
+   log(`acceptHunk(${basename}): total hunks=${hunks.length}`);
+   const hunk = hunks.find(h => hunkId(h) === id);
+-  if (!hunk) { log(`acceptHunk(${basename}): hunk not found, skip`); return; }
++  // The button belongs to a hunk that has changed since it was drawn, so redraw them all.
++  if (!hunk) { log(`acceptHunk(${basename}): hunk not found, skip`); onStateChanged(); return; }
+ 
+   const originalNewStart = hunk.newStart;
+ 
+@@ -216,12 +223,13 @@ export function acceptHunk(
    log(`acceptHunk(${basename}): remainingHunks=${remainingHunks.length}`);
    if (remainingHunks.length === 0) {
      log(`acceptHunk(${basename}): last hunk, exitReviewing`);
@@ -617,7 +634,7 @@ index 0a92f8b..70da5a4 100644
    log(`acceptHunk(${basename}): done`);
  }
  
-@@ -234,9 +241,7 @@ function revealNextHunk(filePath: string, remainingHunks: ReturnType<typeof comp
+@@ -234,9 +242,7 @@ function revealNextHunk(filePath: string, remainingHunks: ReturnType<typeof comp
    const next = remainingHunks.find(h => h.newStart >= originalNewStart) ?? remainingHunks[0];
    if (!next) return;
  
@@ -628,7 +645,17 @@ index 0a92f8b..70da5a4 100644
  }
  
  export async function discardHunk(
-@@ -305,10 +310,10 @@ export async function discardHunk(
+@@ -259,7 +265,8 @@ export async function discardHunk(
+   const allHunks = computeHunks(fileState.baseline, doc.getText());
+   log(`discardHunk(${basename}): total hunks=${allHunks.length}`);
+   const hunk = allHunks.find(h => hunkId(h) === id);
+-  if (!hunk) { log(`discardHunk(${basename}): hunk not found, skip`); return; }
++  // The button belongs to a hunk that has changed since it was drawn, so redraw them all.
++  if (!hunk) { log(`discardHunk(${basename}): hunk not found, skip`); onStateChanged(); return; }
+ 
+   const originalNewStart = hunk.newStart;
+ 
+@@ -305,10 +312,10 @@ export async function discardHunk(
        }
        log(`discardHunk(${basename}): no hunks left, exitReviewing`);
        stateManager.exitReviewing(filePath);
@@ -1073,10 +1100,143 @@ index e652a63..2e80672 100644
        this.disposeInsetList(list);
      }
 diff --git a/src/diffEngine.ts b/src/diffEngine.ts
-index 96e6c36..6a0a012 100644
+index 96e6c36..9342924 100644
 --- a/src/diffEngine.ts
 +++ b/src/diffEngine.ts
-@@ -73,3 +73,133 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
+@@ -15,9 +15,104 @@ export function hunkId(hunk: ParsedHunk): string {
+   return `${hunk.newStart}:${hunk.newLines}:${hunk.oldStart}:${hunk.oldLines}`;
+ }
+ 
+-export function computeHunks(baseline: string | null, current: string): ParsedHunk[] {
+-  const changes = Diff.diffLines(baseline ?? '', current);
++// Diffs run on the extension host's event loop, which every other extension (Claude Code
++// included) shares, and jsdiff's time grows with the square of the number of changed lines:
++// a large rewrite, or a file whose line endings all changed, took seconds. So line diffs stop at
++// this many removed plus added lines (about 0.1 s), and such a change becomes one block instead,
++// see diffLines(). Bounding the work rather than the time keeps the hunks (and so their ids) the
++// same on every run.
++const MAX_EDIT_LENGTH = 1000;
++// rebaseBaseline() needs the exact parts of a change of yours, to tell which of them touch the
++// tool's hunks, so that diff gets a larger bound (under a second, for a change of over a thousand
++// lines, e.g. reformatting a file).
++const MAX_OTHER_EDIT_LENGTH = 2500;
++// A safety net in case a diff is slow for another reason than its number of changed lines.
++const LINE_DIFF_TIMEOUT_MS = 2000;
++// The word diffs of changedRanges() only decide which words get a darker highlight, and run for
++// every hunk on every redraw, so a short time limit is enough for them.
++const WORD_DIFF_TIMEOUT_MS = 20;
++
++// jsdiff gives up beyond options.maxEditLength or after options.timeout ms, and then returns
++// undefined; its type definitions know neither the timeout nor the undefined result.
++type AbortableDiff = (oldStr: string, newStr: string, options: { maxEditLength?: number; timeout: number }) => Diff.Change[] | undefined;
++const diffLinesAbortable = Diff.diffLines as unknown as AbortableDiff;
++const diffWordsWithSpaceAbortable = Diff.diffWordsWithSpace as unknown as AbortableDiff;
++
++// The latest boundedDiffLines() results, most recent first: right after a change, the file
++// watcher, the decorations, the panel, the code lens and the editor controls all diff the same
++// texts, and every refresh diffs every file under review. Kept to a total of RECENT_DIFFS_CHARS
++// characters of diffed text.
++const recentDiffs: { oldText: string; newText: string; maxEditLength: number; changes: Diff.Change[] | undefined }[] = [];
++const RECENT_DIFFS = 64;
++const RECENT_DIFFS_CHARS = 8 * 1024 * 1024;
++
++/** Diff.diffLines() of oldText and newText, or undefined when more than maxEditLength lines changed. */
++function boundedDiffLines(oldText: string, newText: string, maxEditLength: number): Diff.Change[] | undefined {
++  const index = recentDiffs.findIndex(entry => entry.maxEditLength === maxEditLength && entry.oldText === oldText && entry.newText === newText);
++  if (index >= 0) {
++    const [entry] = recentDiffs.splice(index, 1);
++    recentDiffs.unshift(entry);
++    return entry.changes;
++  }
++  // jsdiff takes the longest for the diffs it gives up on, so skip those when that is certain.
++  const changes = exceedsEditLength(oldText, newText, maxEditLength)
++    ? undefined
++    : diffLinesAbortable(oldText, newText, { maxEditLength, timeout: LINE_DIFF_TIMEOUT_MS });
++  const size = (entry: { oldText: string; newText: string }) => entry.oldText.length + entry.newText.length;
++  if (size({ oldText, newText }) <= RECENT_DIFFS_CHARS / 4) {
++    recentDiffs.unshift({ oldText, newText, maxEditLength, changes });
++    let total = recentDiffs.reduce((sum, entry) => sum + size(entry), 0);
++    while (recentDiffs.length > RECENT_DIFFS || total > RECENT_DIFFS_CHARS) total -= size(recentDiffs.pop()!);
++  }
++  return changes;
++}
++
++/**
++ * Whether a line diff of the two texts certainly has more than maxEditLength removed plus added
++ * lines: every line that one text has more often than the other is removed or added. Typing in a
++ * file with a large pending change would otherwise wait for jsdiff to give up on every keystroke.
++ */
++function exceedsEditLength(oldText: string, newText: string, maxEditLength: number): boolean {
++  const oldTokens = lineTokens(oldText);
++  const newTokens = lineTokens(newText);
++  if (oldTokens.length + newTokens.length <= maxEditLength) return false;
++  const counts = new Map<string, number>();
++  for (const token of oldTokens) counts.set(token, (counts.get(token) ?? 0) + 1);
++  for (const token of newTokens) counts.set(token, (counts.get(token) ?? 0) - 1);
++  let changed = 0;
++  for (const count of counts.values()) changed += Math.abs(count);
++  return changed > maxEditLength;
++}
++
++/**
++ * Diff.diffLines() of up to MAX_EDIT_LENGTH changed lines. For a larger change, the lines both
++ * texts start and end with are unchanged, and everything in between is one change.
++ */
++function diffLines(oldText: string, newText: string): Diff.Change[] {
++  const changes = boundedDiffLines(oldText, newText, MAX_EDIT_LENGTH);
++  if (changes) return changes;
++  const oldTokens = lineTokens(oldText);
++  const newTokens = lineTokens(newText);
++  let start = 0;
++  while (start < oldTokens.length && start < newTokens.length && oldTokens[start] === newTokens[start]) start++;
++  let oldEnd = oldTokens.length;
++  let newEnd = newTokens.length;
++  while (oldEnd > start && newEnd > start && oldTokens[oldEnd - 1] === newTokens[newEnd - 1]) {
++    oldEnd--;
++    newEnd--;
++  }
++  const part = (tokens: string[], kind: { added?: boolean; removed?: boolean }): Diff.Change[] =>
++    tokens.length === 0 ? [] : [{ value: tokens.join(''), count: tokens.length, ...kind }];
++  return [
++    ...part(oldTokens.slice(0, start), {}),
++    ...part(oldTokens.slice(start, oldEnd), { removed: true }),
++    ...part(newTokens.slice(start, newEnd), { added: true }),
++    ...part(oldTokens.slice(oldEnd), {}),
++  ];
++}
+ 
++export function computeHunks(baseline: string | null, current: string): ParsedHunk[] {
++  const changes = diffLines(baseline ?? '', current);
+   const hunks: ParsedHunk[] = [];
+   let oldLine = 1;
+   let newLine = 1;
+@@ -38,8 +133,8 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
+     // Start of a changed region — collect consecutive added/removed blocks
+     const hunkOldStart = oldLine;
+     const hunkNewStart = newLine;
+-    const removed: string[] = [];
+-    const added: string[] = [];
++    let removed: string[] = [];
++    let added: string[] = [];
+ 
+     while (i < changes.length && (changes[i].added || changes[i].removed)) {
+       const c = changes[i];
+@@ -48,11 +143,12 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
+         ? c.value.slice(0, -1).split('\n')
+         : c.value.split('\n');
+ 
++      // concat() rather than push(...lines), which throws for a change of over ~100k lines.
+       if (c.removed) {
+-        removed.push(...lines);
++        removed = removed.concat(lines);
+         oldLine += lines.length;
+       } else if (c.added) {
+-        added.push(...lines);
++        added = added.concat(lines);
+         newLine += lines.length;
+       }
+       i++;
+@@ -73,3 +169,157 @@ export function computeHunks(baseline: string | null, current: string): ParsedHu
    return hunks;
  }
  
@@ -1090,13 +1250,14 @@ index 96e6c36..6a0a012 100644
 +/** A changed region as 0-based, end-exclusive line token ranges in the old and new text. */
 +interface TokenHunk { oldStart: number; oldEnd: number; newStart: number; newEnd: number }
 +
-+function tokenHunks(oldText: string, newText: string): TokenHunk[] {
++/** The changed regions of a line diff (diffLines() or boundedDiffLines()). */
++function tokenHunks(changes: Diff.Change[]): TokenHunk[] {
 +  const hunks: TokenHunk[] = [];
 +  let oldPos = 0;
 +  let newPos = 0;
 +  let current: TokenHunk | undefined;
-+  for (const change of Diff.diffLines(oldText, newText)) {
-+    const n = lineTokens(change.value).length;
++  for (const change of changes) {
++    const n = change.count ?? lineTokens(change.value).length;
 +    if (!change.added && !change.removed) {
 +      oldPos += n;
 +      newPos += n;
@@ -1140,21 +1301,30 @@ index 96e6c36..6a0a012 100644
 + * stays under review until it is accepted or discarded); all other parts are applied to the
 + * baseline, so computeHunks(result, after) yields only the (possibly edited) pending hunks. A
 + * null baseline means the tool created the file, which then stays a new file under review.
++ *
++ * The pending hunks are the ones computeHunks() shows, also when a large pending change is one
++ * block there. A change that is too large to diff exactly (see MAX_OTHER_EDIT_LENGTH) is folded
++ * in completely, which leaves no pending hunks: otherwise parts of it far from the pending hunks
++ * could become part of them, and discarding those would undo them.
 + */
 +export function rebaseBaseline(baseline: string | null, before: string, after: string): string | null {
 +  if (baseline === null) return null;
-+  const result = lineTokens(baseline);
-+  const pending = tokenHunks(baseline, before);
++  const changes = boundedDiffLines(before, after, MAX_OTHER_EDIT_LENGTH);
++  if (!changes) return after;
++  let result = lineTokens(baseline);
++  const pending = tokenHunks(diffLines(baseline, before));
 +  const afterTokens = lineTokens(after);
 +
-+  const folded = tokenHunks(before, after).filter(c => !pending.some(p => rangesTouch(p.newStart, p.newEnd, c.oldStart, c.oldEnd)));
++  const folded = tokenHunks(changes).filter(c => !pending.some(p => rangesTouch(p.newStart, p.newEnd, c.oldStart, c.oldEnd)));
 +  // Apply from the end so earlier positions in result stay valid. A folded change lies between
 +  // pending hunks, where before and baseline match line for line, apart from a shift.
 +  for (const c of folded.reverse()) {
 +    const shift = pending
 +      .filter(p => p.newEnd <= c.oldStart)
 +      .reduce((sum, p) => sum + (p.oldEnd - p.oldStart) - (p.newEnd - p.newStart), 0);
-+    result.splice(c.oldStart + shift, c.oldEnd - c.oldStart, ...afterTokens.slice(c.newStart, c.newEnd));
++    // Not splice(..., ...tokens), which throws for a change of over ~100k lines.
++    const at = c.oldStart + shift;
++    result = result.slice(0, at).concat(afterTokens.slice(c.newStart, c.newEnd), result.slice(at + c.oldEnd - c.oldStart));
 +  }
 +  return result.join('');
 +}
@@ -1167,6 +1337,11 @@ index 96e6c36..6a0a012 100644
 +// Beyond this many characters, a hunk only gets whole-line highlights (word diffs get slow).
 +const MAX_CHANGED_RANGES_CHARS = 20000;
 +
++// The latest changedRanges() results, by the text of their hunk: every redraw of an editor needs
++// them for each of its hunks.
++const recentRanges = new Map<string, { removed: LineRange[]; added: LineRange[] }>();
++const RECENT_RANGES = 200;
++
 +/**
 + * The parts of a hunk's lines that actually changed, word by word, like the darker highlights
 + * in VS Code's diff editor. Pure additions and deletions have none, since every line changed.
@@ -1177,9 +1352,16 @@ index 96e6c36..6a0a012 100644
 +  const oldText = removed.join('\n');
 +  const newText = added.join('\n');
 +  if (oldText.length + newText.length > MAX_CHANGED_RANGES_CHARS) return result;
++  // Starting with the length of oldText makes the key unambiguous.
++  const key = `${oldText.length}:${oldText}${newText}`;
++  const recent = recentRanges.get(key);
++  if (recent) return { removed: [...recent.removed], added: [...recent.added] };
++  const parts = diffWordsWithSpaceAbortable(oldText, newText, { timeout: WORD_DIFF_TIMEOUT_MS });
++  // Without parts (too different to diff word by word in time), there are only whole-line
++  // highlights, as for large hunks.
 +  let oldPos = 0;
 +  let newPos = 0;
-+  for (const part of Diff.diffWordsWithSpace(oldText, newText)) {
++  for (const part of parts ?? []) {
 +    const length = part.value.length;
 +    if (part.removed) {
 +      addLineRanges(result.removed, removed, oldPos, oldPos + length);
@@ -1192,7 +1374,9 @@ index 96e6c36..6a0a012 100644
 +      newPos += length;
 +    }
 +  }
-+  return result;
++  recentRanges.set(key, result);
++  if (recentRanges.size > RECENT_RANGES) recentRanges.delete(recentRanges.keys().next().value!);
++  return { removed: [...result.removed], added: [...result.added] };
 +}
 +
 +/** Split the text range [start, end) of lines.join('\n') into per-line ranges (line breaks left out). */
@@ -1211,7 +1395,7 @@ index 96e6c36..6a0a012 100644
 +  }
 +}
 diff --git a/src/extension.ts b/src/extension.ts
-index d78cdf8..e04d663 100644
+index d78cdf8..a7a6f69 100644
 --- a/src/extension.ts
 +++ b/src/extension.ts
 @@ -5,15 +5,17 @@ import { StateManager } from './stateManager';
@@ -1251,15 +1435,19 @@ index d78cdf8..e04d663 100644
    }
  
    /** Notify the diff editor that a specific file's baseline changed (only after accept). */
-@@ -96,6 +102,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -94,8 +100,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+   fileWatcher.suppressAll();
+ 
    try {
++    // load() drops the baselines of ignored files, so it needs the .gitignore rules.
++    await fileWatcher.gitignoreLoaded();
      await stateManager.load((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
      log(`loaded state: enabled=${stateManager.enabled}, files=${stateManager.getAllFiles().size}`);
 +    await fileWatcher.reconcileUnattributed();
    } finally {
      fileWatcher.resumeAll();
    }
-@@ -119,11 +126,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -119,11 +128,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
      }),
      vscode.workspace.onDidChangeTextDocument(e => {
        if (e.document.uri.scheme !== 'file') return;
@@ -1274,7 +1462,7 @@ index d78cdf8..e04d663 100644
      }),
    );
  
-@@ -134,6 +142,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -134,6 +144,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
  
    registerCommands(context, stateManager, fileWatcher, reviewPanel, onStateChanged);
  
@@ -1294,7 +1482,7 @@ index d78cdf8..e04d663 100644
    // ── Diff CodeLens ─────────────────────────────────────────────────────────
    diffCodeLensProvider = new DiffCodeLensProvider(stateManager);
    context.subscriptions.push(
-@@ -156,6 +177,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -156,6 +179,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
        reviewPanel?.setLoading(true);
        try {
          await stateManager.rebuildState((fp, isDir) => fileWatcher.shouldIgnore(fp, isDir));
@@ -1302,7 +1490,7 @@ index d78cdf8..e04d663 100644
          onStateChanged();
        } catch (err) {
          log(`refresh: error — ${err}`);
-@@ -183,6 +205,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -183,6 +207,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
        reviewPanel?.setLoading(false);
        onStateChanged();
      });
@@ -1316,7 +1504,7 @@ index d78cdf8..e04d663 100644
    } else {
      onStateChanged();
    }
-@@ -266,9 +295,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
+@@ -266,9 +297,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ getR
                lastHead = currentHead;
                log(`branch switched → suppressing file watcher and clearing hunks`);
                fileWatcher.suppressAll();
@@ -1328,10 +1516,17 @@ index d78cdf8..e04d663 100644
                  onStateChanged();
                }).catch((err) => {
 diff --git a/src/fileWatcher.ts b/src/fileWatcher.ts
-index f1ef23e..f6e2298 100644
+index f1ef23e..7bb2fa7 100644
 --- a/src/fileWatcher.ts
 +++ b/src/fileWatcher.ts
-@@ -5,9 +5,11 @@ import * as path from 'path';
+@@ -1,13 +1,20 @@
+ import * as vscode from 'vscode';
+ import * as fs from 'fs';
++import * as os from 'os';
+ import * as path from 'path';
++import { execFile } from 'child_process';
++import { promisify } from 'util';
+ // eslint-disable-next-line @typescript-eslint/no-require-imports
  const ignoreLib: ((options?: { ignoreCase?: boolean }) => import('ignore').Ignore) & typeof import('ignore') = require('ignore');
  type Ignore = import('ignore').Ignore;
  import { StateManager } from './stateManager';
@@ -1340,16 +1535,22 @@ index f1ef23e..f6e2298 100644
 +import { computeHunks, rebaseBaseline } from './diffEngine';
  import { log } from './log';
  import { normalizePath } from './pathNormalize';
-+import { ClaudeHookServer, ClaudeToolTracker, claudeEventsDir, pathKey, readTextSync } from './claudeHooks';
++import { ClaudeHookServer, ClaudeToolTracker, ClaudeToolTrackerHandlers, claudeEventsDir, pathKey, readTextSync } from './claudeHooks';
++
++type ClaudeToolDone = Parameters<ClaudeToolTrackerHandlers['onToolDone']>[0];
  
  // Transform gitignore rules from a sub-directory so they work in a single
  // root-level matcher. Adds the directory's relative path as prefix, handling
-@@ -36,14 +38,31 @@ function prefixGitignoreRules(content: string, prefix: string): string {
+@@ -36,20 +43,52 @@ function prefixGitignoreRules(content: string, prefix: string): string {
    }).join('\n');
  }
  
++const execFileAsync = promisify(execFile);
++
 +// How often files under review are compared with the disk, for changes the file watcher missed.
 +const REVIEW_POLL_MS = 2000;
++// How long to wait for more .gitignore changes before reloading the rules.
++const GITIGNORE_RELOAD_DELAY_MS = 300;
 +
  export class FileWatcher {
    private disposables: vscode.Disposable[] = [];
@@ -1378,7 +1579,48 @@ index f1ef23e..f6e2298 100644
    private onStateChanged: () => void;
    private onIgnoreRulesChanged: (() => void) | undefined;
    // Compiled ignore instance from workspace .gitignore
-@@ -75,23 +94,7 @@ export class FileWatcher {
+   private gitignoreMatcher: Ignore = ignoreLib();
++  // The latest load of gitignoreMatcher (see loadGitignore()), how many were started, and which
++  // of them gitignoreMatcher comes from.
++  private gitignoreLoad: Promise<void> = Promise.resolve();
++  private gitignoreStarted = 0;
++  private gitignoreInUse = 0;
++  private gitignoreReloadTimer: NodeJS.Timeout | undefined;
++  private disposed = false;
++  // Compiled ignore instance from the user's ignorePatterns, and the patterns it was built from.
++  private userMatcher: { patterns: string[]; matcher: Ignore } | undefined;
+   // When true, all file-system events are suppressed (used during branch switch)
+   private _suppressed: boolean = false;
++  // Claude tool calls that finished while events were suppressed, for resumeAll() to handle.
++  private suppressedToolDone: ClaudeToolDone[] = [];
+ 
+   constructor(
+     private stateManager: StateManager,
+@@ -61,13 +100,18 @@ export class FileWatcher {
+   }
+ 
+   register(context: vscode.ExtensionContext): void {
+-    this.loadGitignore();
++    void this.loadGitignore();
+ 
+     const gitignoreWatcher = vscode.workspace.createFileSystemWatcher('**/.gitignore');
+-    gitignoreWatcher.onDidChange(() => { this.loadGitignore(); this.onIgnoreRulesChanged?.(); });
+-    gitignoreWatcher.onDidCreate(() => { this.loadGitignore(); this.onIgnoreRulesChanged?.(); });
+-    gitignoreWatcher.onDidDelete(() => { this.loadGitignore(); this.onIgnoreRulesChanged?.(); });
+-    this.disposables.push(gitignoreWatcher);
++    gitignoreWatcher.onDidChange(uri => this.onGitignoreEvent(uri));
++    gitignoreWatcher.onDidCreate(uri => this.onGitignoreEvent(uri));
++    gitignoreWatcher.onDidDelete(uri => this.onGitignoreEvent(uri));
++    this.disposables.push(gitignoreWatcher, {
++      dispose: () => {
++        this.disposed = true;
++        clearTimeout(this.gitignoreReloadTimer);
++      },
++    });
+ 
+     const watcher = vscode.workspace.createFileSystemWatcher('**/*');
+     watcher.onDidChange(uri => this.onDiskChange(uri));
+@@ -75,23 +119,7 @@ export class FileWatcher {
      watcher.onDidCreate(uri => this.onDiskCreate(uri));
      this.disposables.push(watcher);
  
@@ -1402,7 +1644,7 @@ index f1ef23e..f6e2298 100644
        // onWillRenameFiles fires BEFORE the actual rename. Record paths so
        // the subsequent onDiskDelete/onDiskCreate events are suppressed, and
        // migrate state+git. UI refresh is deferred to onDidRenameFiles because
-@@ -105,6 +108,13 @@ export class FileWatcher {
+@@ -105,6 +133,13 @@ export class FileWatcher {
            this.pendingRenameOldPaths.add(oldPath);
            this.selfEditFiles.add(newPath);
            this.stateManager.renameFile(oldPath, newPath);
@@ -1416,7 +1658,7 @@ index f1ef23e..f6e2298 100644
          }
        }),
        vscode.workspace.onDidRenameFiles(e => {
-@@ -125,6 +135,47 @@ export class FileWatcher {
+@@ -125,71 +160,166 @@ export class FileWatcher {
      });
      this.disposables.push(docChange);
  
@@ -1464,7 +1706,165 @@ index f1ef23e..f6e2298 100644
      context.subscriptions.push(...this.disposables);
    }
  
-@@ -208,7 +259,16 @@ export class FileWatcher {
+-  private loadGitignore(): void {
++  /** Resolves once the .gitignore rules are at least as recent as the latest (re)load. */
++  gitignoreLoaded(): Promise<void> {
++    return this.gitignoreLoad;
++  }
++
++  /**
++   * A .gitignore file was created, changed or deleted. Its rules only count when collectGitignores()
++   * reads it, which it does not in ignored directories, so the ones that tools keep in their ignored
++   * caches (.pytest_cache, .ruff_cache, .venv, ...) are skipped. Not while a load is on its way,
++   * though: that may have read the file before this change, and use rules that ignore it no more.
++   */
++  private onGitignoreEvent(uri: vscode.Uri): void {
+     const rootPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+-    this.gitignoreMatcher = ignoreLib();
+-    if (!rootPath) return;
++    const dir = rootPath ? path.relative(rootPath, path.dirname(uri.fsPath)).replace(/\\/g, '/') : '';
++    // The same test as in collectGitignores() (the user's ignorePatterns play no part in it).
++    const unread = dir !== '' && !dir.startsWith('..') && !path.isAbsolute(dir)
++      && (dir.split('/').includes('.git') || this.gitignoreMatcher.ignores(dir + '/'));
++    if (unread && this.gitignoreInUse === this.gitignoreStarted) return;
++    this.scheduleGitignoreReload();
++  }
++
++  /** Reload the .gitignore rules once a burst of .gitignore changes (e.g. a git checkout) is over. */
++  private scheduleGitignoreReload(): void {
++    clearTimeout(this.gitignoreReloadTimer);
++    this.gitignoreReloadTimer = setTimeout(() => {
++      this.gitignoreReloadTimer = undefined;
++      const load = this.loadGitignore();
++      // Only once no later reload is on its way, which then does this itself.
++      void load.then(() => { if (!this.disposed && load === this.gitignoreLoad) this.onIgnoreRulesChanged?.(); });
++    }, GITIGNORE_RELOAD_DELAY_MS);
++  }
++
++  /**
++   * Rebuild the .gitignore rules in the background, and switch to them once complete. This walks
++   * every directory of the workspace that is not ignored, which blocked the extension host for
++   * a while when it was done synchronously.
++   */
++  private loadGitignore(): Promise<void> {
++    const load = ++this.gitignoreStarted;
++    this.gitignoreLoad = this.buildGitignoreMatcher().then(
++      matcher => {
++        // A load that started later and finished first read newer .gitignore files.
++        if (load < this.gitignoreInUse) return;
++        this.gitignoreMatcher = matcher;
++        this.gitignoreInUse = load;
++      },
++      err => log(`loading the .gitignore rules failed: ${err}`),
++    );
++    return this.gitignoreLoad;
++  }
++
++  private async buildGitignoreMatcher(): Promise<Ignore> {
++    const matcher = ignoreLib();
++    const rootPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
++    if (!rootPath) return matcher;
+ 
+     // Load global gitignore (core.excludesfile or default ~/.config/git/ignore)
++    let globalPath: string | undefined;
+     try {
+-      const { execFileSync } = require('child_process');
+-      const globalPath = (execFileSync('git', ['config', '--global', 'core.excludesfile'], {
++      globalPath = (await execFileAsync('git', ['config', '--global', 'core.excludesfile'], {
+         encoding: 'utf-8',
+         timeout: 3000,
+-      }) as string).trim();
+-      if (globalPath) {
+-        const resolved = globalPath.startsWith('~')
+-          ? path.join(require('os').homedir(), globalPath.slice(1))
+-          : globalPath;
+-        try {
+-          this.gitignoreMatcher.add(fs.readFileSync(resolved, 'utf-8'));
+-        } catch { /* file may not exist */ }
+-      }
+-    } catch {
+-      // No core.excludesfile configured — try default location
++      })).stdout.trim();
++    } catch { /* No core.excludesfile configured. */ }
++    if (globalPath === undefined) {
++      // No core.excludesfile configured, so try the default location.
+       try {
+-        const defaultPath = path.join(require('os').homedir(), '.config', 'git', 'ignore');
+-        this.gitignoreMatcher.add(fs.readFileSync(defaultPath, 'utf-8'));
++        matcher.add(await fs.promises.readFile(path.join(os.homedir(), '.config', 'git', 'ignore'), 'utf-8'));
+       } catch { /* no global gitignore */ }
++    } else if (globalPath) {
++      try {
++        const resolved = globalPath.startsWith('~')
++          ? path.join(os.homedir(), globalPath.slice(1))
++          : globalPath;
++        matcher.add(await fs.promises.readFile(resolved, 'utf-8'));
++      } catch { /* file may not exist */ }
+     }
+ 
+     // Collect all .gitignore files recursively from workspace root.
+     // Root .gitignore rules are added directly; sub-directory rules get a
+     // relative-path prefix so the single matcher instance handles scoping.
+-    this.collectGitignores(rootPath, rootPath);
++    await this.collectGitignores(matcher, rootPath, rootPath);
++    return matcher;
+   }
+ 
+   /**
+    * Recursively collect .gitignore files starting from `dir`.
+    * Skips directories already ignored by the current matcher state.
++   * Directories are visited one at a time, so the rules are added in the same order as before.
+    */
+-  private collectGitignores(dir: string, rootPath: string): void {
++  private async collectGitignores(matcher: Ignore, dir: string, rootPath: string): Promise<void> {
+     const gitignorePath = path.join(dir, '.gitignore');
+     try {
+-      const content = fs.readFileSync(gitignorePath, 'utf-8');
++      const content = await fs.promises.readFile(gitignorePath, 'utf-8');
+       if (dir === rootPath) {
+-        this.gitignoreMatcher.add(content);
++        matcher.add(content);
+       } else {
+         const prefix = path.relative(rootPath, dir).replace(/\\/g, '/');
+-        this.gitignoreMatcher.add(prefixGitignoreRules(content, prefix));
++        matcher.add(prefixGitignoreRules(content, prefix));
+       }
+     } catch { /* no .gitignore in this directory */ }
+ 
+     let entries: fs.Dirent[];
+     try {
+-      entries = fs.readdirSync(dir, { withFileTypes: true });
++      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+     } catch { return; }
+ 
+     for (const entry of entries) {
+-      if (!entry.isDirectory()) continue;
++      // Git never reads .gitignore files inside a .git directory, and walking those directories
++      // (all of their object folders) made this walk several times slower.
++      if (!entry.isDirectory() || entry.name === '.git') continue;
+       const full = path.join(dir, entry.name);
+       const rel = path.relative(rootPath, full).replace(/\\/g, '/');
+       // Skip directories already ignored — no need to descend
+-      if (this.gitignoreMatcher.ignores(rel + '/')) continue;
+-      this.collectGitignores(full, rootPath);
++      if (matcher.ignores(rel + '/')) continue;
++      await this.collectGitignores(matcher, full, rootPath);
+     }
+   }
+ 
+@@ -201,6 +331,11 @@ export class FileWatcher {
+   /** Resume file-system event handling after branch switch completes. */
+   resumeAll(): void {
+     this._suppressed = false;
++    // Claude Code keeps working while hunkwise starts, so the tool calls that finished meanwhile
++    // now get their hunks, one after the other.
++    const done = this.suppressedToolDone;
++    this.suppressedToolDone = [];
++    void done.reduce((previous, event) => previous.then(() => this.onClaudeToolDone(event)), Promise.resolve());
+   }
+ 
+   markSelfEdit(filePath: string): void {
+@@ -208,7 +343,16 @@ export class FileWatcher {
    }
  
    clearSelfEdit(filePath: string): void {
@@ -1482,7 +1882,7 @@ index f1ef23e..f6e2298 100644
    }
  
    shouldIgnore(filePath: string, isDirectory?: boolean): boolean {
-@@ -238,7 +298,9 @@ export class FileWatcher {
+@@ -238,271 +382,374 @@ export class FileWatcher {
  
      relPath = relPath.replace(/\\/g, '/');
      if (!relPath || relPath === '.') return false;
@@ -1493,7 +1893,19 @@ index f1ef23e..f6e2298 100644
  
      // The `ignore` library requires a trailing slash to match directory-only
      // patterns (e.g. `.vscode-test/`). Without it, `ignores('.vscode-test')`
-@@ -253,256 +315,336 @@ export class FileWatcher {
+     // returns false even though the pattern is meant to ignore that directory.
+     if (isDirectory) relPath += '/';
+ 
+-    const userMatcher = ignoreLib().add(this.stateManager.ignorePatterns);
+-    if (userMatcher.ignores(relPath)) return true;
++    // Compiling the patterns on every call made this slow, and it runs for every file event (and for
++    // every baseline at startup). StateManager replaces the array whenever the patterns change.
++    const patterns = this.stateManager.ignorePatterns;
++    if (this.userMatcher?.patterns !== patterns) this.userMatcher = { patterns, matcher: ignoreLib().add(patterns) };
++    if (this.userMatcher.matcher.ignores(relPath)) return true;
+ 
+     if (this.stateManager.respectGitignore && this.gitignoreMatcher.ignores(relPath)) return true;
+ 
      return false;
    }
  
@@ -1640,6 +2052,10 @@ index f1ef23e..f6e2298 100644
 -    if (!git) { log(`onDiskDelete(${basename}): no git, skip`); return; }
 +  /** A file changed. content is its new text, null when it was deleted, undefined to read it from disk. */
 +  private async onObservedChange(filePath: string, content?: string | null): Promise<void> {
++    // Only files under review have a baseline to update. Reading every other file that changes
++    // (e.g. all the files a checkout or formatter touches) kept the extension host busy. Deletions
++    // still go on: a deleted directory can contain files under review.
++    if (content === undefined && !this.stateManager.getFile(filePath)) return;
 +    const current = content !== undefined ? content : await readText(filePath);
 +    if (current === undefined) return; // Unreadable, e.g. a directory.
 +    // A file that is gone again right after its create/change event gets its own delete event.
@@ -1666,8 +2082,6 @@ index f1ef23e..f6e2298 100644
 +   */
 +  private async applyOtherChange(filePath: string, content: string | null, persist: boolean): Promise<void> {
 +    const basename = path.basename(filePath);
-+    // Checking also reads new tool call events, so a call's start is always known before its write.
-+    if (this.tracker?.isWorkingOn(filePath)) this.changedDuringClaude.add(filePath);
 +    const state = this.stateManager.getFile(filePath);
 +    if (!state) {
 +      // Not under review, so there is no baseline to update. A deleted directory can still
@@ -1675,6 +2089,9 @@ index f1ef23e..f6e2298 100644
 +      if (content === null) this.removeTree(filePath);
 +      return;
 +    }
++    // Checking also reads new tool call events, so a call's start is always known before its write.
++    // Only needed for files under review: for others, onClaudeToolDone() has no state to go back to.
++    if (this.tracker?.isWorkingOn(filePath)) this.changedDuringClaude.add(filePath);
 +    if (content === null) {
 +      log(`${basename}: deleted, dropping its hunks`);
 +      this.removeTree(filePath);
@@ -1788,16 +2205,20 @@ index f1ef23e..f6e2298 100644
 -    if (fileState?.status === 'reviewing') {
 -      // Already has diff — recompute against known baseline
 -      this.recomputeHunks(filePath, fileState.baseline, diskContent);
--      return;
-+  private async onClaudeToolDone(event: { id: string; filePath: string; before: string | null | undefined; after: string | null | undefined }): Promise<void> {
++  private async onClaudeToolDone(event: ClaudeToolDone): Promise<void> {
 +    const filePath = this.toWorkspacePath(event.filePath);
 +    if (!filePath) return;
++    // The review state is incomplete while suppressed (e.g. while it is loaded), see resumeAll().
++    if (this._suppressed) {
++      this.suppressedToolDone.push(event);
+       return;
+     }
 +    const snapshot = this.claudeSnapshots.get(event.id);
 +    this.claudeSnapshots.delete(event.id);
 +    const stillWorking = this.tracker?.isWorkingOn(filePath) ?? false;
 +    const changedMeanwhile = this.changedDuringClaude.has(filePath);
 +    if (!stillWorking) this.changedDuringClaude.delete(filePath);
-+    if (this._suppressed || !this.stateManager.enabled || this.shouldIgnore(filePath)) return;
++    if (!this.stateManager.enabled || this.shouldIgnore(filePath)) return;
 +
 +    // Changes seen while the tool ran were handled as yours, including the tool's own write.
 +    // Go back to the review state from before the call; the steps below replay them properly.
@@ -1805,7 +2226,7 @@ index f1ef23e..f6e2298 100644
 +      this.stateManager.setFile(filePath, snapshot.state);
 +      if (snapshot.known !== undefined) this.knownContent.set(filePath, snapshot.known);
 +      else this.knownContent.delete(filePath);
-     }
++    }
  
 -    const git = this.stateManager.git;
 -    if (!git) return;
@@ -1884,7 +2305,10 @@ index f1ef23e..f6e2298 100644
 +
 +  /** Remove a deleted file or directory (and everything under it) from tracking. */
 +  private removeTree(filePath: string): void {
-+    this.stateManager.removeFile(filePath);
++    // Only files under review have a baseline in git. Starting git for every other deleted file
++    // (e.g. all the files a checkout deletes) kept the extension host busy, and a baseline that
++    // is left over after all is dropped by the next load(), which finds its file deleted.
++    if (this.stateManager.getFile(filePath)) this.stateManager.removeFile(filePath);
 +    this.forget(filePath);
 +    const prefix = filePath + path.sep;
 +    for (const child of Array.from(this.stateManager.getAllFiles().keys())) {
@@ -1929,21 +2353,26 @@ index f1ef23e..f6e2298 100644
 +      }
 +    }
 +    const accepted: string[] = [];
++    const ended: string[] = [];
 +    let kept = 0;
 +    for (const [filePath, state] of Array.from(this.stateManager.getAllFiles())) {
 +      if (state.status !== 'reviewing') continue;
 +      const disk = await readText(filePath);
 +      if (disk === undefined) continue;
++      // Changed meanwhile (e.g. by a Claude tool call), and handled by what changed it.
++      if (this.stateManager.getFile(filePath) !== state) continue;
 +      const known = this.knownContent.get(filePath);
 +      if (known === undefined) {
 +        accepted.push(path.basename(filePath));
-+        if (disk === null) this.stateManager.removeFile(filePath);
-+        else this.stateManager.exitReviewing(filePath);
++        if (this.stateManager.endReview(filePath)) ended.push(filePath);
 +        continue;
 +      }
 +      kept++;
 +      if (disk !== known) await this.applyOtherChange(filePath, disk, true);
 +    }
++    // Their baselines all at once: after baselines left over from an earlier version of hunkwise,
++    // these can be many.
++    this.stateManager.removeBaselines(ended);
 +    if (accepted.length > 0) log(`reconcile: accepted ${accepted.length} change(s) not made by Claude: ${accepted.slice(0, 20).join(', ')}`);
 +    log(`reconcile: ${kept} file(s) with Claude changes to review`);
 +    this.scheduleSaveKnown();
@@ -2040,7 +2469,7 @@ index f1ef23e..f6e2298 100644
    }
  
    dispose(): void {
-@@ -510,8 +652,17 @@ export class FileWatcher {
+@@ -510,8 +757,17 @@ export class FileWatcher {
        clearTimeout(timer);
      }
      this.debounceTimers.clear();
@@ -2280,10 +2709,60 @@ index 0000000..f8e16cf
 +</body></html>`;
 +}
 diff --git a/src/hunkwiseGit.ts b/src/hunkwiseGit.ts
-index 8e0ff05..ad4bd42 100644
+index 8e0ff05..7c1c011 100644
 --- a/src/hunkwiseGit.ts
 +++ b/src/hunkwiseGit.ts
-@@ -76,6 +76,11 @@ export class HunkwiseGit {
+@@ -1,11 +1,25 @@
+ import * as fs from 'fs';
+ import * as path from 'path';
+-import { execFile } from 'child_process';
++import { execFile, spawn } from 'child_process';
+ import { promisify } from 'util';
+ import { normalizePath } from './pathNormalize';
++import { MAX_FILE_BYTES } from './types';
+ 
+ const execFileAsync = promisify(execFile);
+ 
++// Output limit of git(), and the largest baseline getBaseline() and getBaselines() return: the
++// largest file Claude Code's hooks capture, so the review of any file can be restored after a restart.
++const MAX_GIT_OUTPUT_BYTES = MAX_FILE_BYTES;
++
++// The variables that point git at parts of another repository (`git rev-parse --local-env-vars`),
++// apart from GIT_DIR and GIT_WORK_TREE, which env sets.
++const REPOSITORY_VARIABLES = [
++  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
++  'GIT_OBJECT_DIRECTORY', 'GIT_IMPLICIT_WORK_TREE', 'GIT_GRAFT_FILE', 'GIT_INDEX_FILE',
++  'GIT_NO_REPLACE_OBJECTS', 'GIT_REPLACE_REF_BASE', 'GIT_PREFIX', 'GIT_SHALLOW_FILE',
++  'GIT_COMMON_DIR', 'GIT_NAMESPACE',
++];
++
+ interface Settings {
+   ignorePatterns: string[];
+   respectGitignore: boolean;
+@@ -59,23 +73,32 @@ export class HunkwiseGit {
+   // ── env / low-level git ───────────────────────────────────────────────────
+ 
+   private get env(): NodeJS.ProcessEnv {
+-    return {
++    const env: NodeJS.ProcessEnv = {
+       ...process.env,
+       GIT_DIR: this.gitDir,
+       GIT_WORK_TREE: this.workTree,
+       GIT_TERMINAL_PROMPT: '0',
+     };
++    // Left from the environment of whatever started VS Code, these would mix in another repository,
++    // e.g. GIT_INDEX_FILE (the project's index) when VS Code is the editor of a git commit there.
++    for (const name of REPOSITORY_VARIABLES) delete env[name];
++    return env;
+   }
+ 
+   private async git(args: string[]): Promise<string> {
+     const { stdout } = await execFileAsync('git', ['-c', 'core.quotepath=false', ...args], {
+       cwd: this.workTree,
+       env: this.env,
+-      maxBuffer: 10 * 1024 * 1024, // 10 MB — default 1 MB is too small for large files
++      maxBuffer: MAX_GIT_OUTPUT_BYTES, // The default of 1 MB is too small for large files.
+     });
      return stdout;
    }
  
@@ -2295,7 +2774,7 @@ index 8e0ff05..ad4bd42 100644
    // ── settings.json ─────────────────────────────────────────────────────────
  
    private get settingsPath(): string {
-@@ -185,7 +190,7 @@ export class HunkwiseGit {
+@@ -185,7 +208,7 @@ export class HunkwiseGit {
     */
    async snapshot(filePath: string, content: string): Promise<void> {
      await this.initGit();
@@ -2304,7 +2783,7 @@ index 8e0ff05..ad4bd42 100644
      try {
        const hash = await new Promise<string>((resolve, reject) => {
          const child = execFile(
-@@ -210,8 +215,8 @@ export class HunkwiseGit {
+@@ -210,8 +233,8 @@ export class HunkwiseGit {
     */
    async renameFile(oldFilePath: string, newFilePath: string): Promise<void> {
      await this.initGit();
@@ -2315,7 +2794,7 @@ index 8e0ff05..ad4bd42 100644
      try {
        // ls-files returns all entries matching the path (a single file or all files under a directory)
        const lsOut = await this.git(['ls-files', '--stage', '--', oldRel]);
-@@ -255,7 +260,7 @@ export class HunkwiseGit {
+@@ -255,7 +278,7 @@ export class HunkwiseGit {
     */
    async removeFile(filePath: string): Promise<void> {
      await this.initGit();
@@ -2324,7 +2803,7 @@ index 8e0ff05..ad4bd42 100644
      try {
        const lsOut = await this.git(['ls-files', '--stage', '--', rel]);
        if (!lsOut.trim()) return; // not tracked — nothing to remove
-@@ -275,21 +280,30 @@ export class HunkwiseGit {
+@@ -275,21 +298,30 @@ export class HunkwiseGit {
      if (files.length === 0) return;
      await this.initGit();
      try {
@@ -2363,7 +2842,7 @@ index 8e0ff05..ad4bd42 100644
        // Stage all entries, chunked to avoid OS argument length limits
        const CHUNK = 100;
        for (let i = 0; i < entries.length; i += CHUNK) {
-@@ -310,7 +324,7 @@ export class HunkwiseGit {
+@@ -310,7 +342,7 @@ export class HunkwiseGit {
      if (filePaths.length === 0) return;
      await this.initGit();
      try {
@@ -2372,7 +2851,7 @@ index 8e0ff05..ad4bd42 100644
        // Chunk to avoid exceeding OS argument length limits (~250KB on macOS)
        const CHUNK = 200;
        for (let i = 0; i < rels.length; i += CHUNK) {
-@@ -336,7 +350,7 @@ export class HunkwiseGit {
+@@ -336,7 +368,7 @@ export class HunkwiseGit {
     */
    async getBaseline(filePath: string): Promise<string | undefined> {
      await this.initGit();
@@ -2380,6 +2859,160 @@ index 8e0ff05..ad4bd42 100644
 +    const rel = this.toRel(filePath);
      try {
        return await this.git(['show', `:${rel}`]);
+     } catch {
+@@ -344,16 +376,150 @@ export class HunkwiseGit {
+     }
+   }
+ 
++  /**
++   * getBaseline() for many files at once: the baselines of the files that have one, by file path.
++   * Two git processes read them all (`git ls-files` for the blob of each path, then
++   * `git cat-file --batch` for the blobs), since starting a process blocks the extension host's
++   * event loop for a moment (10-20 ms on Windows), and with that every other extension, Claude
++   * Code included. A `git show` per file froze VS Code for minutes in a workspace with thousands
++   * of baselines.
++   */
++  async getBaselines(filePaths: string[]): Promise<Map<string, string>> {
++    const baselines = new Map<string, string>();
++    if (filePaths.length === 0) return baselines;
++    await this.initGit();
++    try {
++      const index = await this.indexBlobs();
++      // Full object ids rather than names such as ":<path>", which git can read as something
++      // else: a name that ends in "-g<hex>" also stands for an abbreviated commit id.
++      const oids = filePaths.map(filePath => index.get(this.toRel(filePath)));
++      const blobs = await this.readBlobs(Array.from(new Set(oids.filter((oid): oid is string => oid !== undefined))));
++      filePaths.forEach((filePath, i) => {
++        const blob = blobs.get(oids[i] ?? '');
++        if (blob !== undefined) baselines.set(filePath, blob.toString('utf-8'));
++      });
++    } catch (err) {
++      // Like getBaseline(), which returns undefined when git fails: the files are left out.
++      this.log(`getBaselines failed (${filePaths.length} files): ${err}`);
++    }
++    return baselines;
++  }
++
++  /** The blob of each path in the index (at stage 0, like ":<path>"), by path as toRel() gives it. */
++  private async indexBlobs(): Promise<Map<string, string>> {
++    const { stdout } = await execFileAsync('git', ['ls-files', '--stage', '-z'], {
++      cwd: this.workTree,
++      env: this.env,
++      maxBuffer: 64 * 1024 * 1024,
++    });
++    const index = new Map<string, string>();
++    // "<mode> <oid> <stage>\t<path>", NUL-terminated, so paths are not quoted.
++    for (const entry of stdout.split('\0')) {
++      const match = /^\d+ ([0-9a-f]+) 0\t([\s\S]+)$/.exec(entry);
++      if (match) index.set(normalizePath(match[2]), match[1]);
++    }
++    return index;
++  }
++
++  /**
++   * The content of each blob, by object id. Leaves out the blobs git cannot read (e.g. a damaged
++   * one), and the ones larger than git() can return, so getBaselines() returns what getBaseline() would.
++   */
++  private async readBlobs(oids: string[]): Promise<Map<string, Buffer>> {
++    const blobs = new Map<string, Buffer>();
++    let start = 0;
++    let failedRuns = 0;
++    while (start < oids.length) {
++      const { contents, error } = await this.catFileBatch(oids.slice(start));
++      contents.forEach((content, i) => { if (content !== undefined) blobs.set(oids[start + i], content); });
++      if (error === undefined) break;
++      this.log(`reading baselines: ${error}`);
++      // git stopped at a blob it could not read: carry on after that one, but not when git
++      // cannot read anything at all (e.g. when it is missing), which would start a git per blob.
++      failedRuns = contents.length > 0 ? 0 : failedRuns + 1;
++      if (failedRuns >= 2) break;
++      start += contents.length + 1;
++    }
++    return blobs;
++  }
++
++  /**
++   * Read blobs in one `git cat-file --batch` process: the content of each, in the same order, or
++   * undefined when there is no such blob or it is larger than git() can return. When git stops
++   * early (at a blob it cannot read), contents only has the blobs before that one, and error says why.
++   */
++  private catFileBatch(oids: string[]): Promise<{ contents: (Buffer | undefined)[]; error?: string }> {
++    return new Promise(resolve => {
++      const child = spawn('git', ['cat-file', '--batch'], { cwd: this.workTree, env: this.env });
++      const contents: (Buffer | undefined)[] = [];
++      let stderr = '';
++      // Bytes received but not parsed yet, and the object whose content is being received: its
++      // content bytes still to come (followed by a newline), whether it is kept, its parts, and
++      // the last byte received.
++      let pending: Buffer = Buffer.alloc(0);
++      let current: { left: number; keep: boolean; parts: Buffer[]; last: number } | undefined;
++      let outOfStep = false;
++      child.stdout.on('data', (data: Buffer) => {
++        if (outOfStep) return;
++        pending = pending.length > 0 ? Buffer.concat([pending, data]) : data;
++        while (pending.length > 0) {
++          if (!current) {
++            const eol = pending.indexOf(0x0a);
++            if (eol < 0) return;
++            const header = pending.toString('utf-8', 0, eol);
++            pending = pending.subarray(eol + 1);
++            // "<oid> <type> <size>" when found; "<oid> missing" when not.
++            const found = /^[0-9a-f]+ (\S+) (\d+)$/.exec(header);
++            if (!found) {
++              contents.push(undefined);
++              continue;
++            }
++            const size = Number(found[2]);
++            current = { left: size + 1, keep: found[1] === 'blob' && size <= MAX_GIT_OUTPUT_BYTES, parts: [], last: -1 };
++            continue;
++          }
++          const take = Math.min(current.left, pending.length);
++          if (current.keep) current.parts.push(pending.subarray(0, take));
++          current.last = pending[take - 1];
++          pending = pending.subarray(take);
++          current.left -= take;
++          if (current.left === 0) {
++            // Content is followed by a newline. Without it, the rest cannot be told apart, so stop
++            // there: readBlobs() then carries on after this object.
++            if (current.last !== 0x0a) {
++              outOfStep = true;
++              child.kill();
++              return;
++            }
++            // Drop the newline that follows the content.
++            contents.push(current.keep ? Buffer.concat(current.parts).subarray(0, -1) : undefined);
++            current = undefined;
++          }
++        }
++      });
++      child.stderr.on('data', (data: Buffer) => { stderr += data.toString('utf-8'); });
++      // Writing fails when git exits early; the close handler reports that.
++      child.stdin.on('error', () => { /* Reported on close. */ });
++      const stopped = (reason: string) => resolve({ contents, error: `git cat-file ${reason} after ${contents.length} of ${oids.length} objects` });
++      child.on('error', err => stopped(`failed (${err.message})`));
++      child.on('close', code => {
++        if (code === 0 && contents.length === oids.length) resolve({ contents });
++        else stopped(`exited with ${code}${stderr.trim() ? ` (${stderr.trim()})` : ''}`);
++      });
++      child.stdin.end(oids.join('\n') + '\n', 'utf-8');
++    });
++  }
++
+   /**
+    * Return absolute paths of all files currently tracked in HEAD.
+    */
+   async listTrackedFiles(): Promise<string[]> {
+     await this.initGit();
+     try {
+-      const out = await this.git(['ls-tree', 'HEAD', '--name-only', '-r']);
++      // NUL-terminated, so paths come unquoted and keep any leading or trailing spaces.
++      const out = await this.git(['ls-tree', '-r', '-z', '--name-only', 'HEAD']);
+       return out
+-        .split('\n')
+-        .map(l => l.trim())
++        .split('\0')
+         .filter(Boolean)
+         .map(rel => normalizePath(path.join(this.workTree, rel)));
      } catch {
 diff --git a/src/reviewPanel.ts b/src/reviewPanel.ts
 index 92e57f6..b941a62 100644
@@ -2569,14 +3202,25 @@ index 0000000..960b379
 +  }
 +}
 diff --git a/src/stateManager.ts b/src/stateManager.ts
-index 505450d..0256f68 100644
+index 505450d..6a8da3b 100644
 --- a/src/stateManager.ts
 +++ b/src/stateManager.ts
-@@ -33,19 +33,31 @@ export class StateManager {
+@@ -8,6 +8,10 @@ import { normalizePath } from './pathNormalize';
+ 
+ const DEFAULT_IGNORE_PATTERNS = process.platform === 'darwin' ? ['.git', '.DS_Store'] : ['.git'];
+ 
++// Baselines are read and compared with the disk this many files at a time, which bounds the
++// memory used when git holds many of them (e.g. left over from an earlier version of hunkwise).
++const BASELINE_CHUNK = 200;
++
+ /** Format a list of absolute paths for logging: show relative paths, max 20. */
+ function logFileList(files: string[], rootPath: string | undefined): string {
+   const rel = files.map(fp => rootPath ? path.relative(rootPath, fp) : fp);
+@@ -33,19 +37,31 @@ export class StateManager {
    // Serial queue: git ops run one at a time; flush() awaits the tail
    private gitQueue: Promise<void> = Promise.resolve();
  
-+  // Files that had a baseline in git at the last load() or rebuildState().
++  // Files that had a baseline in git at the last load() or rebuildState(), also when it could not be read.
 +  private baselinesAtLoad = new Set<string>();
 +
    // Optional callback invoked when a git failure causes an in-memory rollback
@@ -2606,7 +3250,7 @@ index 505450d..0256f68 100644
    // ── accessors ─────────────────────────────────────────────────────────────
  
    get enabled(): boolean { return this._enabled; }
-@@ -59,44 +71,11 @@ export class StateManager {
+@@ -59,44 +75,13 @@ export class StateManager {
    get git(): HunkwiseGit | undefined { return this._git; }
  
    /**
@@ -2614,6 +3258,8 @@ index 505450d..0256f68 100644
 -   * These are externally created new files that should be shown with null baseline.
 +   * Whether filePath had a baseline in git at the last load() or rebuildState(). Only files under
 +   * review keep a baseline in git, except new files (null baseline), which are never stored there.
++   * Also true when that baseline could not be read (e.g. a damaged object): the file then must not
++   * come back as a new file under review, since discarding that would delete it.
     */
 -  private async collectUntrackedFiles(
 -    trackedSet: Set<string>,
@@ -2655,11 +3301,50 @@ index 505450d..0256f68 100644
    }
  
    // ── init / load ───────────────────────────────────────────────────────────
-@@ -172,24 +151,21 @@ export class StateManager {
+@@ -134,62 +119,80 @@ export class StateManager {
+     // Initialize git (idempotent) then restore in-memory state from HEAD
+     await g.initGit();
+     const tracked = await g.listTrackedFiles();
+-    const ignored: string[] = [];
+-    const skippedNoBaseline: string[] = [];
+-    const reviewing: string[] = [];
+-    const idle: string[] = [];
+-    await Promise.all(tracked.map(async filePath => {
+-      if (shouldIgnore?.(filePath)) {
+-        ignored.push(filePath);
+-        return;
+-      }
+-      const baseline = await g.getBaseline(filePath);
+-      if (baseline === undefined) {
+-        skippedNoBaseline.push(filePath);
+-        return;
+-      }
+-      // Compare baseline with current disk content — enter reviewing if there's a real diff
+-      // or if the file has been deleted (so the user can restore it via discard).
+-      // Use a single readFile call to avoid TOCTOU race (existsSync + readFile).
+-      let diskContent: string | undefined;
+-      let fileDeleted = false;
+-      try {
+-        diskContent = await fs.promises.readFile(filePath, 'utf-8');
+-      } catch (err: any) {
+-        if (err?.code === 'ENOENT') { fileDeleted = true; } // file doesn't exist
+-        // other errors (e.g. permissions) → diskContent stays undefined, treat as idle
+-      }
+-      if (fileDeleted || (diskContent !== undefined && diskContent !== baseline)) {
+-        this.state.set(filePath, { status: 'reviewing', baseline });
+-        reviewing.push(filePath);
+-      } else {
+-        idle.push(filePath);
+-      }
+-    }));
++    const { ignored, reviewing, idle, skippedNoBaseline } = await this.compareWithDisk(g, tracked, shouldIgnore);
+     if (skippedNoBaseline.length > 0) {
+       log(`load: skipped ${skippedNoBaseline.length} file(s) with no baseline in index: ${logFileList(skippedNoBaseline, this.workspaceRoot)}`);
+     }
      if (reviewing.length > 0) {
        log(`load: ${reviewing.length} file(s) have diffs: ${logFileList(reviewing, this.workspaceRoot)}`);
      }
-+    this.baselinesAtLoad = new Set([...reviewing, ...idle]);
++    this.baselinesAtLoad = new Set([...reviewing, ...idle, ...skippedNoBaseline]);
 +    // Only files under review need a baseline. Unchanged ones are left over from an earlier
 +    // version of hunkwise (which kept a baseline of every file), or from reviews that ended
 +    // while hunkwise was not running.
@@ -2672,7 +3357,13 @@ index 505450d..0256f68 100644
        log(`load: removing ${ignored.length} ignored file(s) from git: ${logFileList(ignored, this.workspaceRoot)}`);
 -      this.gitQueue = this.gitQueue.then(() => g.removeFileBatch(ignored)).catch(err => { log(`git queue error: ${err}`); });
      }
--
++    const toRemove = [...ignored, ...idle];
++    if (toRemove.length > 0) {
++      this.gitQueue = this.gitQueue.then(() => g.removeFileBatch(toRemove)).catch(err => { log(`git queue error: ${err}`); });
++    }
++    // New files under review have no baseline in git; FileWatcher.reconcileUnattributed() restores them.
++  }
+ 
 -    // Detect files on disk not tracked in git — these are externally created new files
 -    const trackedSet = new Set(tracked);
 -    const untrackedFiles = await this.collectUntrackedFiles(trackedSet, shouldIgnore);
@@ -2680,42 +3371,86 @@ index 505450d..0256f68 100644
 -      log(`load: ${untrackedFiles.length} untracked new file(s): ${logFileList(untrackedFiles, this.workspaceRoot)}`);
 -      for (const fp of untrackedFiles) {
 -        this.state.set(fp, { status: 'reviewing', baseline: null });
--      }
-+    const toRemove = [...ignored, ...idle];
-+    if (toRemove.length > 0) {
-+      this.gitQueue = this.gitQueue.then(() => g.removeFileBatch(toRemove)).catch(err => { log(`git queue error: ${err}`); });
++  /**
++   * Compare the baselines of files with their content on disk, and put the ones that differ (or
++   * that were deleted, so the user can restore them via discard) under review. Returns which
++   * files are ignored (and so not compared), which went under review, which match their
++   * baseline, and which have no baseline to compare.
++   */
++  private async compareWithDisk(
++    g: HunkwiseGit,
++    filePaths: string[],
++    shouldIgnore?: (filePath: string, isDirectory?: boolean) => boolean,
++  ): Promise<{ ignored: string[]; reviewing: string[]; idle: string[]; skippedNoBaseline: string[] }> {
++    const ignored: string[] = [];
++    const reviewing: string[] = [];
++    const idle: string[] = [];
++    const skippedNoBaseline: string[] = [];
++    for (let i = 0; i < filePaths.length; i += BASELINE_CHUNK) {
++      // Let the rest of the extension host (other extensions included) run between chunks.
++      if (i > 0) await new Promise(resolve => setImmediate(resolve));
++      // Checked per chunk too: matching a path against the .gitignore rules for the first time is
++      // slow enough that thousands of them in one go would block the event loop for a while.
++      const chunk: string[] = [];
++      for (const filePath of filePaths.slice(i, i + BASELINE_CHUNK)) {
++        if (shouldIgnore?.(filePath)) ignored.push(filePath);
++        else chunk.push(filePath);
+       }
++      const baselines = await g.getBaselines(chunk);
++      await Promise.all(chunk.map(async filePath => {
++        const baseline = baselines.get(filePath);
++        if (baseline === undefined) {
++          skippedNoBaseline.push(filePath);
++          return;
++        }
++        // A single readFile call avoids the race between existsSync() and reading the file.
++        let diskContent: string | undefined;
++        let fileDeleted = false;
++        try {
++          diskContent = await fs.promises.readFile(filePath, 'utf-8');
++        } catch (err: any) {
++          if (err?.code === 'ENOENT') { fileDeleted = true; }
++          // Other errors (e.g. permissions) leave diskContent undefined, so the file counts as idle.
++        }
++        if (fileDeleted || (diskContent !== undefined && diskContent !== baseline)) {
++          this.state.set(filePath, { status: 'reviewing', baseline });
++          reviewing.push(filePath);
++        } else {
++          idle.push(filePath);
++        }
++      }));
      }
-+    // New files under review have no baseline in git; FileWatcher.reconcileUnattributed() restores them.
++    return { ignored, reviewing, idle, skippedNoBaseline };
    }
  
    /**
-@@ -219,9 +195,12 @@ export class StateManager {
+@@ -218,27 +221,15 @@ export class StateManager {
+     this.state.clear();
      await g.initGit();
      const tracked = await g.listTrackedFiles();
-     const filtered = tracked.filter(fp => !shouldIgnore?.(fp));
-+    const idle: string[] = [];
-+    this.baselinesAtLoad = new Set();
-     await Promise.all(filtered.map(async filePath => {
-       const baseline = await g.getBaseline(filePath);
-       if (baseline === undefined) return;
-+      this.baselinesAtLoad.add(filePath);
-       let diskContent: string | undefined;
-       let fileDeleted = false;
-       try {
-@@ -231,14 +210,17 @@ export class StateManager {
-       }
-       if (fileDeleted || (diskContent !== undefined && diskContent !== baseline)) {
-         this.state.set(filePath, { status: 'reviewing', baseline });
-+      } else {
-+        idle.push(filePath);
-       }
-     }));
+-    const filtered = tracked.filter(fp => !shouldIgnore?.(fp));
+-    await Promise.all(filtered.map(async filePath => {
+-      const baseline = await g.getBaseline(filePath);
+-      if (baseline === undefined) return;
+-      let diskContent: string | undefined;
+-      let fileDeleted = false;
+-      try {
+-        diskContent = await fs.promises.readFile(filePath, 'utf-8');
+-      } catch (err: any) {
+-        if (err?.code === 'ENOENT') { fileDeleted = true; }
+-      }
+-      if (fileDeleted || (diskContent !== undefined && diskContent !== baseline)) {
+-        this.state.set(filePath, { status: 'reviewing', baseline });
+-      }
+-    }));
 -
 -    // Detect files on disk not tracked in git — these are externally created new files
 -    const trackedSet = new Set(tracked);
 -    const untrackedFiles = await this.collectUntrackedFiles(trackedSet, shouldIgnore);
 -    for (const fp of untrackedFiles) {
 -      this.state.set(fp, { status: 'reviewing', baseline: null });
++    const { reviewing, idle, skippedNoBaseline } = await this.compareWithDisk(g, tracked, shouldIgnore);
++    this.baselinesAtLoad = new Set([...reviewing, ...idle, ...skippedNoBaseline]);
 +    // Only files under review need a baseline (see load()).
 +    if (idle.length > 0) {
 +      this.gitQueue = this.gitQueue.then(() => g.removeFileBatch(idle)).catch(err => { log(`git queue error: ${err}`); });
@@ -2726,7 +3461,19 @@ index 505450d..0256f68 100644
      }
  
      // Compare old vs new state
-@@ -358,17 +340,6 @@ export class StateManager {
+@@ -312,8 +303,9 @@ export class StateManager {
+       const g = this._git;
+       this.gitQueue = this.gitQueue.then(() => g.removeFile(filePath)).catch(err => {
+         log(`git queue error (removeFile rollback): ${err}`);
+-        // Only rollback if no newer operation has re-added the entry
+-        if (!this.state.has(filePath) && oldState) {
++        // Only rollback if no newer operation has re-added the entry, and hunkwise was not
++        // disabled meanwhile (the queued git work then fails, as the repo is gone).
++        if (!this.state.has(filePath) && oldState && this._git === g) {
+           this.state.set(filePath, { ...oldState });
+           this.onRollback?.();
+         }
+@@ -358,17 +350,6 @@ export class StateManager {
      }
    }
  
@@ -2744,7 +3491,7 @@ index 505450d..0256f68 100644
    getAllFiles(): ReadonlyMap<string, FileState> {
      return this.state;
    }
-@@ -378,32 +349,27 @@ export class StateManager {
+@@ -378,32 +359,53 @@ export class StateManager {
    }
  
    /**
@@ -2781,7 +3528,8 @@ index 505450d..0256f68 100644
 +    this.gitQueue = this.gitQueue.then(() => g.removeFile(filePath)).catch(err => {
 +      log(`git queue error (exitReviewing rollback): ${err}`);
 +      // Restore reviewing state so the user can retry rather than the review coming back on reload
-+      if (!this.state.has(filePath) && oldState) {
++      // (unless hunkwise was disabled meanwhile, see removeFile()).
++      if (!this.state.has(filePath) && oldState && this._git === g) {
 +        this.state.set(filePath, { ...oldState });
 +        this.onRollback?.();
 +        void vscode.window.showErrorMessage(
@@ -2790,10 +3538,35 @@ index 505450d..0256f68 100644
        }
 -    }
 +    });
++  }
++
++  /**
++   * Ends a review right away, like exitReviewing(), but leaves its baseline in git for
++   * removeBaselines(), which removes many with one git commit. Returns whether it had a baseline
++   * that may be in git (new files have none).
++   */
++  endReview(filePath: string): boolean {
++    filePath = normalizePath(filePath);
++    const hadBaseline = this.state.get(filePath)?.baseline !== null;
++    this.state.delete(filePath);
++    return hadBaseline;
++  }
++
++  /**
++   * Remove the baselines of files whose reviews ended (see endReview()) from git, with one commit
++   * for all of them instead of one per file (each of which starts several git processes). A file
++   * that is under review again by now keeps its new baseline. If git fails, the baselines stay in
++   * git, and load() puts those files under review again next time, for the caller to end again.
++   */
++  removeBaselines(filePaths: string[]): void {
++    const g = this._git;
++    const ended = filePaths.map(normalizePath).filter(filePath => !this.state.has(filePath));
++    if (!g || ended.length === 0) return;
++    this.gitQueue = this.gitQueue.then(() => g.removeFileBatch(ended)).catch(err => { log(`git queue error: ${err}`); });
    }
  
  
-@@ -429,51 +395,6 @@ export class StateManager {
+@@ -429,51 +431,6 @@ export class StateManager {
      }
    }
  
@@ -2845,7 +3618,7 @@ index 505450d..0256f68 100644
    private currentSettings() {
      return { ignorePatterns: this._ignorePatterns, respectGitignore: this._respectGitignore, clearOnBranchSwitch: this._clearOnBranchSwitch, quoteRotationInterval: this._quoteRotationInterval, useDiffEditor: this._useDiffEditor, showInlineDecorations: this._showInlineDecorations };
    }
-@@ -540,10 +461,8 @@ export class StateManager {
+@@ -540,14 +497,14 @@ export class StateManager {
    }
  
    /**
@@ -2858,7 +3631,14 @@ index 505450d..0256f68 100644
     */
    async syncIgnoreState(shouldIgnore: (filePath: string, isDirectory?: boolean) => boolean): Promise<void> {
      const g = this._git;
-@@ -594,102 +513,27 @@ export class StateManager {
+-    if (!g || !this.workspaceRoot) return;
++    // Not while disabled: listTrackedFiles() would create the git repo, which enables hunkwise
++    // again on the next start (e.g. after a .gitignore change).
++    if (!g || !this._enabled || !this.workspaceRoot) return;
+ 
+     const collect = async (dir: string): Promise<string[]> => {
+       let results: string[] = [];
+@@ -594,102 +551,28 @@ export class StateManager {
        this.gitQueue = this.gitQueue.then(() => g.removeFileBatch(toRemove)).catch(err => { log(`git queue error: ${err}`); });
      }
  
@@ -2908,7 +3688,9 @@ index 505450d..0256f68 100644
 -  async clearHunksOnBranchSwitch(shouldIgnore?: (filePath: string, isDirectory?: boolean) => boolean): Promise<void> {
 +  async clearHunksOnBranchSwitch(): Promise<void> {
      const g = this._git;
-     if (!g || !this.workspaceRoot) return;
+-    if (!g || !this.workspaceRoot) return;
++    // Not while disabled, see syncIgnoreState().
++    if (!g || !this._enabled || !this.workspaceRoot) return;
  
      const reviewingCount = Array.from(this.state.values()).filter(s => s.status === 'reviewing').length;
 -    log(`clearHunksOnBranchSwitch: clearing ${reviewingCount} reviewing file(s), re-syncing all baselines`);
@@ -2968,12 +3750,45 @@ index 505450d..0256f68 100644
      }
  
      // Wait for all git ops to complete before returning
+diff --git a/src/test/__mocks__/vscode.ts b/src/test/__mocks__/vscode.ts
+index b7a9b05..5d37309 100644
+--- a/src/test/__mocks__/vscode.ts
++++ b/src/test/__mocks__/vscode.ts
+@@ -1,5 +1,7 @@
+-// Minimal vscode stub for unit-testing gitignoreManager.
+-// Only vscode.workspace.workspaceFolders is used.
++// Minimal vscode stub for unit-testing gitignoreManager, StateManager and parts of FileWatcher.
++// Only vscode.workspace.workspaceFolders, textDocuments and asRelativePath(), and vscode.Uri.file() are used.
++
++import * as path from 'path';
+ 
+ declare const global: Record<string, unknown>;
+ 
+@@ -9,4 +11,18 @@ export const workspace = {
+     if (!root) return undefined;
+     return [{ uri: { fsPath: root } }];
+   },
++  // No open documents.
++  textDocuments: [],
++  // Like VS Code: a path outside the workspace comes back unchanged.
++  asRelativePath(uri: { fsPath: string }) {
++    const root = global.__hunkwiseTestRoot as string | undefined;
++    const rel = root ? path.relative(root, uri.fsPath) : '';
++    return !root || rel.startsWith('..') || path.isAbsolute(rel) ? uri.fsPath : rel;
++  },
++};
++
++export const Uri = {
++  file(fsPath: string) {
++    return { fsPath, scheme: 'file' };
++  },
+ };
 diff --git a/src/test/changedRanges.test.ts b/src/test/changedRanges.test.ts
 new file mode 100644
-index 0000000..63af481
+index 0000000..24ff5c2
 --- /dev/null
 +++ b/src/test/changedRanges.test.ts
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,49 @@
 +import { describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { changedRanges } from '../diffEngine';
@@ -3005,6 +3820,22 @@ index 0000000..63af481
 +  it('skips very large hunks', () => {
 +    const big = ['x'.repeat(30000)];
 +    assert.deepEqual(changedRanges(big, ['y']), { removed: [], added: [] });
++  });
++
++  it('returns equal ranges for the same lines again, as new arrays', () => {
++    const first = changedRanges(['let a = 1;'], ['let b = 1;']);
++    const second = changedRanges(['let a = 1;'], ['let b = 1;']);
++    assert.deepEqual(second, first);
++    assert.notEqual(second.removed, first.removed);
++    assert.notEqual(second.added, first.added);
++  });
++
++  it('skips hunks too different to diff word by word in time', () => {
++    // Under the size limit, but thousands of words that all differ: seconds of word diffing.
++    const words = (letter: string) => Array.from({ length: 50 }, (_, line) => Array.from({ length: 48 }, (_, i) => `${letter}${(line * 48 + i) % 97}`).join(' '));
++    const start = Date.now();
++    assert.deepEqual(changedRanges(words('a'), words('b')), { removed: [], added: [] });
++    assert.ok(Date.now() - start < 1000, `took ${Date.now() - start} ms`);
 +  });
 +});
 diff --git a/src/test/claudeHooks.test.ts b/src/test/claudeHooks.test.ts
@@ -3237,6 +4068,291 @@ index 0000000..360b0b8
 +    assert.deepEqual(done, [{ id: 'toolu_1', filePath: file, before: 'original\n', after: 'changed\n' }]);
 +  });
 +});
+diff --git a/src/test/diffEngine.test.ts b/src/test/diffEngine.test.ts
+index 5d559e6..e50aee2 100644
+--- a/src/test/diffEngine.test.ts
++++ b/src/test/diffEngine.test.ts
+@@ -176,6 +176,43 @@ describe('computeHunks', () => {
+   });
+ });  // end computeHunks
+ 
++describe('computeHunks (bounded)', () => {
++  /** count lines, of which every changedEvery-th one (starting with the second) differs between the two texts. */
++  function texts(count: number, changedEvery: number): [string, string] {
++    const make = (changed: string) => Array.from({ length: count }, (_, i) => (i % changedEvery === 1 ? `${changed} ${i}\n` : `same ${i}\n`)).join('');
++    return [make('old'), make('new')];
++  }
++
++  it('makes one hunk of a change with too many changed lines, between the lines both texts share', () => {
++    // 10000 changed lines: a diff that would take jsdiff about a minute.
++    const [oldText, newText] = texts(20000, 2);
++    const start = Date.now();
++    const hunks = computeHunks(oldText + 'end\n', newText + 'end\n');
++    assert.ok(Date.now() - start < 3000, `took ${Date.now() - start} ms`);
++    assert.equal(hunks.length, 1);
++    // The first and the last line are the same in both, everything in between is the one hunk.
++    assert.deepEqual([hunks[0].oldStart, hunks[0].oldLines, hunks[0].newStart, hunks[0].newLines], [2, 19999, 2, 19999]);
++    assert.equal(hunks[0].removedContent[0], 'old 1');
++    assert.equal(hunks[0].addedContent[19998], 'new 19999');
++  });
++
++  it('still diffs a change of up to 500 changed lines line by line, the same way every time', () => {
++    // 400 changed lines, so 400 removed and 400 added ones.
++    const [oldText, newText] = texts(2000, 5);
++    const hunks = computeHunks(oldText, newText);
++    assert.equal(hunks.length, 400);
++    assert.deepEqual(computeHunks(oldText, newText).map(hunkId), hunks.map(hunkId));
++  });
++
++  it('makes one hunk of a change of over 500 changed lines, the same way every time', () => {
++    // 667 changed lines.
++    const [oldText, newText] = texts(2000, 3);
++    const hunks = computeHunks(oldText, newText);
++    assert.equal(hunks.length, 1);
++    assert.deepEqual(computeHunks(oldText, newText).map(hunkId), hunks.map(hunkId));
++  });
++});
++
+ describe('hunkId', () => {
+   it('produces stable id from hunk fields', () => {
+     const hunks = computeHunks('a\nb\nc\n', 'a\nX\nc\n');
+diff --git a/src/test/fileWatcher.test.ts b/src/test/fileWatcher.test.ts
+new file mode 100644
+index 0000000..0833d3b
+--- /dev/null
++++ b/src/test/fileWatcher.test.ts
+@@ -0,0 +1,231 @@
++import { describe, it, beforeEach, afterEach } from 'node:test';
++import assert from 'node:assert/strict';
++import * as fs from 'fs';
++import * as path from 'path';
++import * as os from 'os';
++import ignore, { Ignore } from 'ignore';
++import { FileWatcher } from '../fileWatcher';
++import { StateManager } from '../stateManager';
++
++// FileWatcher uses vscode.workspace.workspaceFolders and asRelativePath().
++// The node_modules/vscode stub reads from global.__hunkwiseTestRoot.
++declare const global: Record<string, unknown>;
++
++let root: string;
++let home: string;
++let fileWatcher: FileWatcher;
++
++// The global git excludes file is part of the rules, so tests get an empty home directory of
++// their own: the rules in the developer's own excludes file would change the results.
++const HOME_VARIABLES = ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL'];
++let savedHome: Record<string, string | undefined> = {};
++
++function write(rel: string, content: string): string {
++  const filePath = path.join(root, rel);
++  fs.mkdirSync(path.dirname(filePath), { recursive: true });
++  fs.writeFileSync(filePath, content, 'utf-8');
++  return filePath;
++}
++
++/** Load the .gitignore rules the way FileWatcher.register() does, and wait until they are in use. */
++async function loadGitignore(): Promise<void> {
++  void (fileWatcher as unknown as { loadGitignore(): Promise<void> }).loadGitignore();
++  await fileWatcher.gitignoreLoaded();
++}
++
++beforeEach(() => {
++  root = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-watcher-'));
++  home = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-home-'));
++  savedHome = Object.fromEntries(HOME_VARIABLES.map(name => [name, process.env[name]]));
++  for (const name of HOME_VARIABLES) delete process.env[name];
++  process.env.HOME = home;
++  process.env.USERPROFILE = home;
++  global.__hunkwiseTestRoot = root;
++  fileWatcher = new FileWatcher(new StateManager(path.join(`${root}-storage`)), () => {});
++});
++
++afterEach(() => {
++  fs.rmSync(root, { recursive: true, force: true });
++  fs.rmSync(home, { recursive: true, force: true });
++  for (const name of HOME_VARIABLES) {
++    if (savedHome[name] === undefined) delete process.env[name];
++    else process.env[name] = savedHome[name];
++  }
++  global.__hunkwiseTestRoot = undefined;
++});
++
++describe('FileWatcher', () => {
++  describe('removeTree', () => {
++    it('only touches the files under review', () => {
++      const stateManager = new StateManager(path.join(`${root}-storage`));
++      const reviewed = path.join(root, 'dir', 'reviewed.txt');
++      stateManager.setFile(reviewed, { status: 'reviewing', baseline: 'before\n' }, true);
++      const removed: string[] = [];
++      stateManager.removeFile = filePath => { removed.push(filePath); };
++      const watcher = new FileWatcher(stateManager, () => {});
++      const removeTree = (filePath: string) => (watcher as unknown as { removeTree(filePath: string): void }).removeTree(filePath);
++
++      removeTree(path.join(root, 'other.txt'));
++      assert.deepEqual(removed, []);
++      removeTree(path.join(root, 'dir'));
++      assert.deepEqual(removed, [reviewed]);
++    });
++  });
++
++  describe('onObservedChange', () => {
++    it('does not read a changed file that is not under review', async () => {
++      const stateManager = new StateManager(path.join(`${root}-storage`));
++      const reviewed = write('reviewed.txt', 'after\n');
++      const other = write('other.txt', 'other\n');
++      stateManager.setFile(reviewed, { status: 'reviewing', baseline: 'before\n' }, true);
++      const watcher = new FileWatcher(stateManager, () => {});
++      const onObservedChange = (filePath: string) => (watcher as unknown as { onObservedChange(filePath: string): Promise<void> }).onObservedChange(filePath);
++      const read: string[] = [];
++      const readFile = fs.promises.readFile;
++      fs.promises.readFile = ((filePath: string, ...rest: unknown[]) => {
++        read.push(filePath);
++        return (readFile as (...args: unknown[]) => Promise<unknown>)(filePath, ...rest);
++      }) as typeof fs.promises.readFile;
++      try {
++        await onObservedChange(other);
++        await onObservedChange(reviewed);
++      } finally {
++        fs.promises.readFile = readFile;
++      }
++      assert.deepEqual(read, [reviewed]);
++    });
++  });
++
++  describe('applyOtherChange', () => {
++    it('only looks for running Claude tool calls on files under review', async () => {
++      const stateManager = new StateManager(path.join(`${root}-storage`));
++      const reviewed = write('reviewed.txt', 'after\n');
++      stateManager.setFile(reviewed, { status: 'reviewing', baseline: 'before\n' }, true);
++      const watcher = new FileWatcher(stateManager, () => {});
++      const internals = watcher as unknown as { tracker: { isWorkingOn(filePath: string): boolean }; applyOtherChange(filePath: string, content: string | null, persist: boolean): Promise<void> };
++      const looked: string[] = [];
++      internals.tracker = { isWorkingOn: filePath => { looked.push(filePath); return false; } };
++
++      await internals.applyOtherChange(path.join(root, 'deleted.txt'), null, true);
++      await internals.applyOtherChange(reviewed, 'after\n', false);
++
++      assert.deepEqual(looked, [reviewed]);
++    });
++  });
++
++  describe('onClaudeToolDone', () => {
++    it('handles a tool call that finished while events were suppressed once they resume', async () => {
++      const stateManager = new StateManager(path.join(`${root}-storage`));
++      await stateManager.setEnabled(true);
++      const watcher = new FileWatcher(stateManager, () => {});
++      const edited = write('edited.txt', 'after\n');
++      const onClaudeToolDone = (event: { id: string; filePath: string; before: string; after: string }) =>
++        (watcher as unknown as { onClaudeToolDone(event: unknown): Promise<void> }).onClaudeToolDone(event);
++
++      watcher.suppressAll();
++      await onClaudeToolDone({ id: 'call-1', filePath: edited, before: 'before\n', after: 'after\n' });
++      assert.equal(stateManager.getFile(edited), undefined);
++      watcher.resumeAll();
++      await new Promise(resolve => setTimeout(resolve, 50));
++
++      assert.deepEqual(stateManager.getFile(edited), { status: 'reviewing', baseline: 'before\n' });
++      await stateManager.flush();
++      fs.rmSync(`${root}-storage`, { recursive: true, force: true });
++    });
++  });
++
++  describe('onGitignoreEvent', () => {
++    type Internals = { onGitignoreEvent(uri: { fsPath: string }): void; loadGitignore(): Promise<void>; gitignoreReloadTimer: NodeJS.Timeout | undefined };
++    /** Whether a .gitignore event for rel schedules a reload of the rules. */
++    function reloads(watcher: FileWatcher, rel: string): boolean {
++      const internals = watcher as unknown as Internals;
++      internals.onGitignoreEvent({ fsPath: path.join(root, rel) });
++      const scheduled = internals.gitignoreReloadTimer !== undefined;
++      clearTimeout(internals.gitignoreReloadTimer);
++      internals.gitignoreReloadTimer = undefined;
++      return scheduled;
++    }
++
++    it('skips .gitignore files in ignored directories', async () => {
++      write('.gitignore', '.pytest_cache/\n');
++      write('.pytest_cache/.gitignore', '*\n');
++      write('sub/.gitignore', '*.log\n');
++      await loadGitignore();
++
++      assert.equal(reloads(fileWatcher, '.pytest_cache/.gitignore'), false);
++      assert.equal(reloads(fileWatcher, '.git/.gitignore'), false);
++      assert.equal(reloads(fileWatcher, 'sub/.gitignore'), true);
++      assert.equal(reloads(fileWatcher, '.gitignore'), true);
++    });
++
++    it('does not skip a directory that only the ignore patterns of the settings ignore', async () => {
++      const stateManager = new StateManager(path.join(`${root}-storage`));
++      stateManager.setIgnorePatterns(['.git', 'packages']);
++      const watcher = new FileWatcher(stateManager, () => {});
++      write('packages/.gitignore', '*.gen.ts\n');
++      await (watcher as unknown as Internals).loadGitignore();
++
++      assert.equal(reloads(watcher, 'packages/.gitignore'), true);
++    });
++
++    it('does not skip anything while a load is on its way', async () => {
++      write('.gitignore', '.pytest_cache/\n');
++      await loadGitignore();
++      const load = (fileWatcher as unknown as Internals).loadGitignore();
++
++      assert.equal(reloads(fileWatcher, '.pytest_cache/.gitignore'), true);
++      await load;
++      assert.equal(reloads(fileWatcher, '.pytest_cache/.gitignore'), false);
++    });
++  });
++
++  describe('shouldIgnore', () => {
++    it('applies the rules of nested .gitignore files to their own directory', async () => {
++      write('.gitignore', '*.log\n');
++      write('sub/.gitignore', 'build/\n!keep.log\n');
++      await loadGitignore();
++
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'a.log')), true);
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'a.txt')), false);
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'sub', 'build', 'out.js')), true);
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'build', 'out.js')), false);
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'sub', 'keep.log')), false);
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'sub', 'other.log')), true);
++    });
++
++    it('ignores the .git directory and any .gitignore inside it', async () => {
++      write('.git/.gitignore', '*.txt\n');
++      write('.git/info/.gitignore', '*.txt\n');
++      await loadGitignore();
++
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'a.txt')), false);
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, '.git', 'HEAD')), true);
++    });
++
++    it('uses the rules of the latest load', async () => {
++      write('.gitignore', '*.log\n');
++      await loadGitignore();
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'a.log')), true);
++
++      write('.gitignore', '*.tmp\n');
++      await loadGitignore();
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'a.log')), false);
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'a.tmp')), true);
++    });
++
++    it('keeps the rules of a later load when an earlier load finishes last', async () => {
++      const internals = fileWatcher as unknown as { loadGitignore(): Promise<void>; buildGitignoreMatcher(): Promise<Ignore> };
++      const finish: ((matcher: Ignore) => void)[] = [];
++      internals.buildGitignoreMatcher = () => new Promise(resolve => finish.push(resolve));
++      const first = internals.loadGitignore();
++      const second = internals.loadGitignore();
++      finish[1](ignore().add('*.tmp'));
++      await second;
++      finish[0](ignore().add('*.log'));
++      await first;
++
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'a.tmp')), true);
++      assert.equal(fileWatcher.shouldIgnore(path.join(root, 'a.log')), false);
++    });
++  });
++});
 diff --git a/src/test/hunkInsetHtml.test.ts b/src/test/hunkInsetHtml.test.ts
 new file mode 100644
 index 0000000..e32cdf6
@@ -3306,10 +4422,19 @@ index 0000000..e32cdf6
 +  });
 +});
 diff --git a/src/test/hunkwiseGit.test.ts b/src/test/hunkwiseGit.test.ts
-index 3422a3f..551247f 100644
+index 3422a3f..0569655 100644
 --- a/src/test/hunkwiseGit.test.ts
 +++ b/src/test/hunkwiseGit.test.ts
-@@ -92,6 +92,15 @@ describe('HunkwiseGit', () => {
+@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
+ import * as fs from 'fs';
+ import * as path from 'path';
+ import * as os from 'os';
++import * as crypto from 'crypto';
++import { execFileSync } from 'child_process';
+ import { HunkwiseGit } from '../hunkwiseGit';
+ 
+ let tmpDir: string;
+@@ -92,6 +94,15 @@ describe('HunkwiseGit', () => {
        await git.snapshotBatch([]);
      });
  
@@ -3325,7 +4450,183 @@ index 3422a3f..551247f 100644
      it('getBaseline is immediately available after snapshotBatch', async () => {
        const filePath = path.join(tmpDir, 'immediate.txt');
        await git.snapshotBatch([{ filePath, content: 'immediate\n' }]);
-@@ -285,7 +294,8 @@ describe('HunkwiseGit', () => {
+@@ -124,6 +135,175 @@ describe('HunkwiseGit', () => {
+     });
+   });
+ 
++  describe('getBaselines', () => {
++    it('returns what getBaseline() returns, and leaves out files without a baseline', async () => {
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-baselines-'));
++      const g2 = new HunkwiseGit(path.join(dir2, '.vscode', 'hunkwise'), dir2);
++      await g2.initGit();
++      const files = [
++        { filePath: path.join(dir2, 'a.txt'), content: 'a\n' },
++        { filePath: path.join(dir2, 'empty.txt'), content: '' },
++        { filePath: path.join(dir2, 'with space.txt'), content: 'crlf\r\nlines\r\n' },
++        { filePath: path.join(dir2, 'sub', '日本語ファイル.txt'), content: 'こんにちは\n' },
++        { filePath: path.join(dir2, 'no-final-newline.txt'), content: 'last line' },
++        { filePath: path.join(dir2, 'same1.txt'), content: 'same\n' },
++        { filePath: path.join(dir2, 'same2.txt'), content: 'same\n' },
++      ];
++      await g2.snapshotBatch(files);
++      const untracked = path.join(dir2, 'untracked.txt');
++      const baselines = await g2.getBaselines([untracked, ...files.map(f => f.filePath)]);
++      assert.equal(baselines.size, files.length);
++      for (const { filePath, content } of files) {
++        assert.strictEqual(baselines.get(filePath), content);
++        assert.strictEqual(await g2.getBaseline(filePath), content);
++      }
++      assert.ok(!baselines.has(untracked));
++      fs.rmSync(dir2, { recursive: true, force: true });
++    });
++
++    it('returns an empty map for no files', async () => {
++      assert.equal((await git.getBaselines([])).size, 0);
++    });
++
++    it('reads the baselines of many files', async () => {
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-baselines-many-'));
++      const g2 = new HunkwiseGit(path.join(dir2, '.vscode', 'hunkwise'), dir2);
++      await g2.initGit();
++      // Neighboring files have different contents, so a baseline matched to the wrong file shows.
++      const files = Array.from({ length: 500 }, (_, i) => ({ filePath: path.join(dir2, `f${i}.txt`), content: `content ${i % 10}\n`.repeat(i % 10) }));
++      await g2.snapshotBatch(files);
++      const baselines = await g2.getBaselines(files.map(f => f.filePath));
++      assert.equal(baselines.size, files.length);
++      for (const { filePath, content } of files) {
++        assert.strictEqual(baselines.get(filePath), content);
++      }
++      fs.rmSync(dir2, { recursive: true, force: true });
++    });
++
++    it('reads baselines as large as the hooks capture, and leaves out larger ones like getBaseline()', async () => {
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-baselines-large-'));
++      const g2 = new HunkwiseGit(path.join(dir2, '.vscode', 'hunkwise'), dir2);
++      await g2.initGit();
++      const large = path.join(dir2, 'large.txt');
++      const tooLarge = path.join(dir2, 'too-large.txt');
++      const small = path.join(dir2, 'small.txt');
++      const largeContent = 'x'.repeat(20 * 1024 * 1024);
++      await g2.snapshotBatch([
++        { filePath: large, content: largeContent },
++        { filePath: tooLarge, content: 'y'.repeat(20 * 1024 * 1024 + 1) },
++        { filePath: small, content: 'small\n' },
++      ]);
++      assert.equal(await g2.getBaseline(tooLarge), undefined);
++      const baselines = await g2.getBaselines([large, tooLarge, small]);
++      assert.ok(baselines.get(large) === largeContent, 'the 20 MB baseline should be read');
++      assert.ok(!baselines.has(tooLarge));
++      assert.strictEqual(baselines.get(small), 'small\n');
++      fs.rmSync(dir2, { recursive: true, force: true });
++    });
++
++    it('still reads the other baselines when a path is outside the work tree', async () => {
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-baselines-outside-'));
++      const g2 = new HunkwiseGit(path.join(dir2, '.vscode', 'hunkwise'), dir2);
++      await g2.initGit();
++      const inside = path.join(dir2, 'inside.txt');
++      await g2.snapshot(inside, 'inside\n');
++      const outside = path.join(path.dirname(dir2), 'outside.txt');
++      const baselines = await g2.getBaselines([outside, inside]);
++      assert.ok(!baselines.has(outside));
++      assert.strictEqual(baselines.get(inside), 'inside\n');
++      fs.rmSync(dir2, { recursive: true, force: true });
++    });
++
++    it('still reads the other baselines when one of them is damaged', async () => {
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-baselines-damaged-'));
++      const hDir = path.join(dir2, '.vscode', 'hunkwise');
++      const g2 = new HunkwiseGit(hDir, dir2);
++      await g2.initGit();
++      const damagedContent = crypto.randomBytes(150000).toString('base64');
++      const files = Array.from({ length: 5 }, (_, i) => ({ filePath: path.join(dir2, `f${i}.txt`), content: i === 2 ? damagedContent : `content ${i}\n` }));
++      await g2.snapshotBatch(files);
++      // Overwrite the middle of the loose object: git then dies while it streams that blob.
++      const oid = crypto.createHash('sha1').update(`blob ${Buffer.byteLength(damagedContent)}\0${damagedContent}`).digest('hex');
++      const objectPath = path.join(hDir, 'git', 'objects', oid.slice(0, 2), oid.slice(2));
++      fs.chmodSync(objectPath, 0o644);
++      const fd = fs.openSync(objectPath, 'r+');
++      fs.writeSync(fd, crypto.randomBytes(200), 0, 200, Math.floor(fs.statSync(objectPath).size / 2));
++      fs.closeSync(fd);
++
++      const baselines = await g2.getBaselines(files.map(f => f.filePath));
++      assert.deepEqual(Array.from(baselines.keys()).sort(), files.filter((_, i) => i !== 2).map(f => f.filePath).sort());
++      for (const { filePath, content } of files.filter((_, i) => i !== 2)) {
++        assert.strictEqual(baselines.get(filePath), content);
++      }
++      fs.rmSync(dir2, { recursive: true, force: true });
++    });
++
++    it('reads the baseline of a file whose name git could also read as an abbreviated commit id', async () => {
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-baselines-describe-'));
++      const hDir = path.join(dir2, '.vscode', 'hunkwise');
++      const g2 = new HunkwiseGit(hDir, dir2);
++      await g2.initGit();
++      await g2.snapshot(path.join(dir2, 'first.txt'), 'first\n');
++      const head = execFileSync('git', ['rev-parse', 'HEAD'], { env: { ...process.env, GIT_DIR: path.join(hDir, 'git') }, encoding: 'utf-8' }).trim();
++      // "<anything>-g<hex>" also names the commit whose id starts with that hex.
++      const odd = path.join(dir2, `build-g${head.slice(0, 7)}`);
++      await g2.snapshot(odd, 'mine\n');
++      assert.strictEqual((await g2.getBaselines([odd])).get(odd), 'mine\n');
++      fs.rmSync(dir2, { recursive: true, force: true });
++    });
++
++    it('reads the baseline of a file whose name starts with a space', async () => {
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-baselines-space-'));
++      const g2 = new HunkwiseGit(path.join(dir2, '.vscode', 'hunkwise'), dir2);
++      await g2.initGit();
++      const spaced = path.join(dir2, ' leading space.txt');
++      await g2.snapshot(spaced, 'spaced\n');
++      assert.deepEqual(await g2.listTrackedFiles(), [spaced]);
++      assert.strictEqual((await g2.getBaselines([spaced])).get(spaced), 'spaced\n');
++      fs.rmSync(dir2, { recursive: true, force: true });
++    });
++
++    // Git for Windows rejects paths with a line break.
++    it('reads a baseline whose path has a line break', { skip: process.platform === 'win32' && 'not on Windows' }, async () => {
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-baselines-newline-'));
++      const g2 = new HunkwiseGit(path.join(dir2, '.vscode', 'hunkwise'), dir2);
++      await g2.initGit();
++      const odd = path.join(dir2, 'line\nbreak.txt');
++      const plain = path.join(dir2, 'plain.txt');
++      await g2.snapshotBatch([
++        { filePath: odd, content: 'odd\n' },
++        { filePath: plain, content: 'plain\n' },
++      ]);
++      const baselines = await g2.getBaselines([odd, plain]);
++      assert.strictEqual(baselines.get(odd), 'odd\n');
++      assert.strictEqual(baselines.get(plain), 'plain\n');
++      fs.rmSync(dir2, { recursive: true, force: true });
++    });
++  });
++
++  describe('env', () => {
++    it('uses its own index, also when the environment points git at another one', async () => {
++      // E.g. when VS Code was started as the editor of a git commit in the project.
++      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-env-'));
++      const otherIndex = path.join(dir2, 'other-index');
++      const saved = process.env.GIT_INDEX_FILE;
++      process.env.GIT_INDEX_FILE = otherIndex;
++      try {
++        const g2 = new HunkwiseGit(path.join(dir2, '.vscode', 'hunkwise'), dir2);
++        await g2.initGit();
++        const filePath = path.join(dir2, 'a.txt');
++        await g2.snapshot(filePath, 'a\n');
++        assert.strictEqual(await g2.getBaseline(filePath), 'a\n');
++        assert.strictEqual((await g2.getBaselines([filePath])).get(filePath), 'a\n');
++        assert.equal(fs.existsSync(otherIndex), false);
++      } finally {
++        if (saved === undefined) delete process.env.GIT_INDEX_FILE;
++        else process.env.GIT_INDEX_FILE = saved;
++        fs.rmSync(dir2, { recursive: true, force: true });
++      }
++    });
++  });
++
+   describe('removeFile', () => {
+     it('removes a tracked file', async () => {
+       const filePath = path.join(tmpDir, 'toremove.txt');
+@@ -285,7 +465,8 @@ describe('HunkwiseGit', () => {
        fs.rmSync(dir2, { recursive: true, force: true });
      });
  
@@ -3337,10 +4638,10 @@ index 3422a3f..551247f 100644
        // must agree on paths so that Set/Map lookups match.
 diff --git a/src/test/rebaseBaseline.test.ts b/src/test/rebaseBaseline.test.ts
 new file mode 100644
-index 0000000..cb5f4a0
+index 0000000..d929cbb
 --- /dev/null
 +++ b/src/test/rebaseBaseline.test.ts
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,172 @@
 +import { describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { computeHunks, rebaseBaseline } from '../diffEngine';
@@ -3470,12 +4771,266 @@ index 0000000..cb5f4a0
 +    const text = lines('a', 'b');
 +    assert.equal(rebaseBaseline(text, text, lines('a', 'b', 'c')), lines('a', 'b', 'c'));
 +  });
++
++  describe('with a pending change that computeHunks() shows as one hunk', () => {
++    // Every other line rewritten by the tool: computeHunks() makes one hunk from line 2 to the last line but one.
++    const pendingLines = (changed: string) => Array.from({ length: 20000 }, (_, i) => (i % 2 === 0 ? `same ${i}` : `${changed} ${i}`));
++    const baseline = lines('first', ...pendingLines('old'), 'last');
++    const before = lines('first', ...pendingLines('new'), 'last');
++
++    it('keeps your edit inside that hunk part of it', () => {
++      // A line the tool did not change, but which lies inside the one hunk.
++      const after = before.replace('same 4\n', 'yours 4\n');
++      assert.equal(rebaseBaseline(baseline, before, after), baseline);
++    });
++
++    it('still folds your edit outside that hunk into the baseline', () => {
++      const after = before.replace('first\n', 'FIRST\n');
++      assert.equal(rebaseBaseline(baseline, before, after), baseline.replace('first\n', 'FIRST\n'));
++    });
++  });
++
++  describe('with a large change of yours', () => {
++    // 2000 lines, of which the tool changed one in the middle.
++    const baseline = lines(...Array.from({ length: 2000 }, (_, i) => `call compute(${i})`));
++    const before = baseline.replace('call compute(1000)\n', 'call computeFast(1000)\n');
++    /** before with every changedEvery-th line renamed by you, away from the tool's line. */
++    const renamed = (changedEvery: number) => lines(...before.split('\n').slice(0, -1).map((line, i) => (i % changedEvery === 0 && i !== 1000 ? line.replace('compute(', 'calculate(') : line)));
++
++    it('folds all of it that does not touch a pending hunk into the baseline', () => {
++      // 667 lines renamed: too many for computeHunks() to diff line by line, not for this.
++      const after = renamed(3);
++      const result = rebaseBaseline(baseline, before, after);
++      const hunks = computeHunks(result, after);
++      assert.equal(hunks.length, 1);
++      assert.deepEqual(hunks[0].removedContent, ['call compute(1000)']);
++      assert.deepEqual(hunks[0].addedContent, ['call computeFast(1000)']);
++    });
++
++    it('folds all of it when it is too large to diff exactly, which ends the review', () => {
++      // 1999 lines renamed.
++      const after = renamed(1);
++      assert.equal(rebaseBaseline(baseline, before, after), after);
++    });
++  });
 +});
+diff --git a/src/test/stateManager.test.ts b/src/test/stateManager.test.ts
+new file mode 100644
+index 0000000..b1f19a4
+--- /dev/null
++++ b/src/test/stateManager.test.ts
+@@ -0,0 +1,195 @@
++import { describe, it, beforeEach, afterEach } from 'node:test';
++import assert from 'node:assert/strict';
++import * as fs from 'fs';
++import * as path from 'path';
++import * as os from 'os';
++import { HunkwiseGit } from '../hunkwiseGit';
++import { StateManager } from '../stateManager';
++
++// StateManager uses vscode.workspace.workspaceFolders.
++// The node_modules/vscode stub reads from global.__hunkwiseTestRoot.
++declare const global: Record<string, unknown>;
++
++let root: string;
++let hunkwiseDir: string;
++
++beforeEach(() => {
++  root = fs.mkdtempSync(path.join(os.tmpdir(), 'hunkwise-state-'));
++  hunkwiseDir = path.join(os.tmpdir(), `${path.basename(root)}-storage`);
++  global.__hunkwiseTestRoot = root;
++});
++
++afterEach(() => {
++  fs.rmSync(root, { recursive: true, force: true });
++  fs.rmSync(hunkwiseDir, { recursive: true, force: true });
++  global.__hunkwiseTestRoot = undefined;
++});
++
++/** Files on disk with a baseline of each, like an earlier version of hunkwise kept of every file. */
++async function leftOverBaselines(count: number): Promise<{ filePath: string; content: string }[]> {
++  const files = Array.from({ length: count }, (_, i) => ({
++    filePath: path.join(root, `dir${i % 3}`, `file${i}.txt`),
++    content: `content ${i % 10}\n`,
++  }));
++  for (const { filePath, content } of files) {
++    fs.mkdirSync(path.dirname(filePath), { recursive: true });
++    fs.writeFileSync(filePath, content, 'utf-8');
++  }
++  const g = new HunkwiseGit(hunkwiseDir, root);
++  await g.initGit();
++  await g.snapshotBatch(files);
++  return files;
++}
++
++describe('StateManager', () => {
++  describe('load', () => {
++    it('reviews only the files that differ from their baseline, and drops the other baselines', async () => {
++      // More files than are read at once, so the baselines are read in several parts.
++      const files = await leftOverBaselines(450);
++      const changed = files[7];
++      const deleted = files[333];
++      const unchangedFile = files[420];
++      fs.writeFileSync(changed.filePath, 'changed\n', 'utf-8');
++      fs.rmSync(deleted.filePath);
++
++      const stateManager = new StateManager(hunkwiseDir);
++      await stateManager.load(() => false);
++      await stateManager.flush();
++
++      assert.equal(stateManager.enabled, true);
++      assert.deepEqual(
++        Array.from(stateManager.getAllFiles().keys()).sort(),
++        [changed.filePath, deleted.filePath].sort(),
++      );
++      assert.deepEqual(stateManager.getFile(changed.filePath), { status: 'reviewing', baseline: changed.content });
++      assert.deepEqual(stateManager.getFile(deleted.filePath), { status: 'reviewing', baseline: deleted.content });
++      assert.equal(stateManager.hadBaselineAtLoad(unchangedFile.filePath), true);
++      const tracked = await new HunkwiseGit(hunkwiseDir, root).listTrackedFiles();
++      assert.deepEqual(tracked.sort(), [changed.filePath, deleted.filePath].sort());
++    });
++
++    it('drops the baselines of ignored files without reviewing them', async () => {
++      const files = await leftOverBaselines(6);
++      const ignoredFile = files[1];
++      fs.writeFileSync(ignoredFile.filePath, 'changed\n', 'utf-8');
++
++      const stateManager = new StateManager(hunkwiseDir);
++      await stateManager.load(filePath => filePath === ignoredFile.filePath);
++      await stateManager.flush();
++
++      assert.equal(stateManager.getFile(ignoredFile.filePath), undefined);
++      assert.deepEqual(await new HunkwiseGit(hunkwiseDir, root).listTrackedFiles(), []);
++    });
++
++    it('counts a baseline that cannot be loaded as one that was there, so its file never shows up as new', async () => {
++      // Too large for getBaseline(), so it is never loaded.
++      const large = path.join(root, 'large.txt');
++      fs.writeFileSync(large, 'x'.repeat(20 * 1024 * 1024 + 1), 'utf-8');
++      const g = new HunkwiseGit(hunkwiseDir, root);
++      await g.initGit();
++      await g.snapshot(large, 'y'.repeat(20 * 1024 * 1024 + 1));
++
++      const stateManager = new StateManager(hunkwiseDir);
++      await stateManager.load(() => false);
++
++      assert.equal(stateManager.getFile(large), undefined);
++      assert.equal(stateManager.hadBaselineAtLoad(large), true);
++    });
++
++    it('stays disabled when there is no git repo', async () => {
++      const stateManager = new StateManager(hunkwiseDir);
++      await stateManager.load(() => false);
++      assert.equal(stateManager.enabled, false);
++      assert.equal(stateManager.getAllFiles().size, 0);
++    });
++  });
++
++  describe('endReview / removeBaselines', () => {
++    /** A state with files 0-2 of four under review (with baselines in git), plus a new file. */
++    async function reviewing(): Promise<{ stateManager: StateManager; files: { filePath: string; content: string }[]; newFile: string }> {
++      const files = await leftOverBaselines(4);
++      for (const file of files.slice(0, 3)) fs.writeFileSync(file.filePath, 'changed\n', 'utf-8');
++      const stateManager = new StateManager(hunkwiseDir);
++      await stateManager.load(() => false);
++      const newFile = path.join(root, 'new.txt');
++      fs.writeFileSync(newFile, 'new\n', 'utf-8');
++      stateManager.setFile(newFile, { status: 'reviewing', baseline: null });
++      await stateManager.flush();
++      assert.equal(stateManager.getAllFiles().size, 4);
++      return { stateManager, files, newFile };
++    }
++
++    it('ends the reviews at once, and removes their baselines from git afterwards', async () => {
++      const { stateManager, files, newFile } = await reviewing();
++
++      assert.equal(stateManager.endReview(files[0].filePath), true);
++      assert.equal(stateManager.endReview(files[2].filePath), true);
++      assert.equal(stateManager.endReview(newFile), false);
++      assert.deepEqual(Array.from(stateManager.getAllFiles().keys()), [files[1].filePath]);
++      stateManager.removeBaselines([files[0].filePath, files[2].filePath]);
++      await stateManager.flush();
++
++      assert.deepEqual(await new HunkwiseGit(hunkwiseDir, root).listTrackedFiles(), [files[1].filePath]);
++    });
++
++    it('keeps the new baseline of a file that is under review again', async () => {
++      const { stateManager, files } = await reviewing();
++
++      stateManager.endReview(files[0].filePath);
++      // E.g. Claude changed it again right after.
++      stateManager.setFile(files[0].filePath, { status: 'reviewing', baseline: 'claude before\n' });
++      stateManager.removeBaselines([files[0].filePath]);
++      await stateManager.flush();
++
++      assert.deepEqual((await new HunkwiseGit(hunkwiseDir, root).listTrackedFiles()).sort(), [files[0].filePath, files[1].filePath, files[2].filePath].sort());
++      assert.equal(await new HunkwiseGit(hunkwiseDir, root).getBaseline(files[0].filePath), 'claude before\n');
++    });
++  });
++
++  describe('syncIgnoreState', () => {
++    it('does not create the git repo while hunkwise is disabled', async () => {
++      const stateManager = new StateManager(hunkwiseDir);
++      await stateManager.load(() => false);
++      assert.equal(stateManager.enabled, false);
++
++      await stateManager.syncIgnoreState(() => false);
++
++      assert.equal(fs.existsSync(path.join(hunkwiseDir, 'git')), false);
++    });
++  });
++
++  describe('setEnabled', () => {
++    it('does not bring back a review whose git removal fails because hunkwise was disabled', async () => {
++      const files = await leftOverBaselines(2);
++      fs.writeFileSync(files[0].filePath, 'changed\n', 'utf-8');
++      const stateManager = new StateManager(hunkwiseDir);
++      await stateManager.load(() => false);
++      await stateManager.flush();
++      assert.equal(stateManager.getAllFiles().size, 1);
++
++      stateManager.exitReviewing(files[0].filePath);
++      await stateManager.setEnabled(false);
++      await stateManager.flush();
++
++      assert.equal(stateManager.getAllFiles().size, 0);
++    });
++  });
++
++  describe('rebuildState', () => {
++    it('reviews the files that differ from their baseline', async () => {
++      const files = await leftOverBaselines(5);
++      const stateManager = new StateManager(hunkwiseDir);
++      await stateManager.load(() => false);
++      await stateManager.flush();
++      assert.equal(stateManager.getAllFiles().size, 0);
++
++      // A baseline that git got from elsewhere (e.g. another window) since load().
++      const g = new HunkwiseGit(hunkwiseDir, root);
++      await g.snapshot(files[2].filePath, 'before\n');
++      await stateManager.rebuildState(() => false);
++
++      assert.deepEqual(Array.from(stateManager.getAllFiles().keys()), [files[2].filePath]);
++      assert.deepEqual(stateManager.getFile(files[2].filePath), { status: 'reviewing', baseline: 'before\n' });
++    });
++  });
++});
+diff --git a/src/types.ts b/src/types.ts
+index 282657e..ca78f9c 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -5,3 +5,6 @@ export interface FileState {
+   /** null = file did not exist before (new file); '' = file existed but was empty; string = file content */
+   baseline: string | null;
+ }
++
++/** The largest file whose content Claude Code's hooks capture, so also the largest baseline of a review. */
++export const MAX_FILE_BYTES = 20 * 1024 * 1024;
 diff --git a/tsconfig.test.json b/tsconfig.test.json
-index 6dac5fd..3121622 100644
+index 6dac5fd..fed0d7d 100644
 --- a/tsconfig.test.json
 +++ b/tsconfig.test.json
-@@ -14,7 +14,10 @@
+@@ -14,7 +14,13 @@
      "src/diffEngine.ts",
      "src/hunkwiseGit.ts",
      "src/gitignoreManager.ts",
@@ -3483,7 +5038,10 @@ index 6dac5fd..3121622 100644
 +    "src/pathNormalize.ts",
 +    "src/claudeHooks.ts",
 +    "src/hunkInsetHtml.ts",
-+    "src/log.ts"
++    "src/log.ts",
++    "src/stateManager.ts",
++    "src/fileWatcher.ts",
++    "src/types.ts"
    ],
    "exclude": [
      "node_modules",
