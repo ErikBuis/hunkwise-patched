@@ -487,10 +487,10 @@ index 0000000..fc84ec1
 +}
 diff --git a/src/claudeCodeDrafts.ts b/src/claudeCodeDrafts.ts
 new file mode 100644
-index 0000000..8938366
+index 0000000..d22ba83
 --- /dev/null
 +++ b/src/claudeCodeDrafts.ts
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,170 @@
 +import * as fs from 'fs';
 +import * as path from 'path';
 +import * as vscode from 'vscode';
@@ -501,7 +501,7 @@ index 0000000..8938366
 +// Folders of installed Claude Code versions, e.g. anthropic.claude-code-2.1.296-win32-x64.
 +const CLAUDE_CODE_DIR = /^anthropic\.claude-code-\d/;
 +// The patch is wrapped in these comments, so that a newer version of it can replace it.
-+const PATCH_VERSION = 3;
++const PATCH_VERSION = 4;
 +const PATCH_BEGIN = `/*hunkwise-drafts-begin:v${PATCH_VERSION}*/`;
 +const PATCH_END = '/*hunkwise-drafts-end*/';
 +const ANY_PATCH = /\/\*hunkwise-drafts-begin:v\d+\*\/[\s\S]*?\/\*hunkwise-drafts-end\*\//g;
@@ -570,17 +570,18 @@ index 0000000..8938366
 +  // One more state and effect after the effect that empties the box. hwDraft.session is the chat
 +  // the box shows and hwDraft.id its session id (which a new chat only gets later). When the chat
 +  // changes, its draft goes in the box (and the text of the previous chat goes out); when only the
-+  // id arrives, a saved draft goes in an empty box; otherwise every change of the text is saved as
-+  // the chat's draft, on the session and in the webview state (s.hunkwiseDrafts, by session id).
++  // id arrives, a saved draft goes in an empty box; otherwise (also when the id arrives after the
++  // user started typing) the text is saved as the chat's draft, on the session and in the webview
++  // state (s.hunkwiseDrafts, by session id).
 +  // try/catch: whatever goes wrong here may never break Claude Code's chat.
 +  const S = session;
 +  const insertAt = start + clearBox.index + clearBox[0].length;
 +  const patch = `${PATCH_BEGIN},(hwDraft=>${useEffect}(()=>{try{`
 +    + `let k=${S}.sessionId?.value,api=globalThis.acquireVsCodeApi?.(),s=api?.getState()||{},m=s.hunkwiseDrafts||{};`
 +    + `if(hwDraft.session!==${S}||hwDraft.id!==k){let isNew=hwDraft.session!==${S};hwDraft.session=${S};hwDraft.id=k;`
-+    + `let d=${S}.hunkwiseDraft??(k?m[k]:void 0);if(isNew?d||${text}:d&&!${text})${setInput}(d||"")}`
-+    + `else{${S}.hunkwiseDraft=${text};if(api&&k&&(m[k]||"")!==${text}){m={...m};delete m[k];if(${text})m[k]=${text};`
-+    + `let ks=Object.keys(m);if(ks.length>${MAX_SAVED_DRAFTS})delete m[ks[0]];api.setState({...api.getState(),hunkwiseDrafts:m})}}`
++    + `let d=${S}.hunkwiseDraft??(k?m[k]:void 0);if(isNew?d||${text}:d&&!${text}){${setInput}(d||"");return}if(isNew)return}`
++    + `${S}.hunkwiseDraft=${text};if(api&&k&&(m[k]||"")!==${text}){m={...m};delete m[k];if(${text})m[k]=${text};`
++    + `let ks=Object.keys(m);if(ks.length>${MAX_SAVED_DRAFTS})delete m[ks[0]];api.setState({...api.getState(),hunkwiseDrafts:m})}`
 +    + `}catch{}},[${text},${S},${S}.sessionId?.value]))(${useState}({})[0])${PATCH_END}`;
 +  return { kind: 'patched', source: shareApi + source.slice(0, insertAt) + patch + source.slice(insertAt) };
 +}
@@ -4502,10 +4503,10 @@ index 0000000..b6143ac
 +});
 diff --git a/src/test/claudeCodeDrafts.test.ts b/src/test/claudeCodeDrafts.test.ts
 new file mode 100644
-index 0000000..bef339b
+index 0000000..7153bde
 --- /dev/null
 +++ b/src/test/claudeCodeDrafts.test.ts
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,224 @@
 +import { beforeEach, describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { patchChatDrafts } from '../claudeCodeDrafts';
@@ -4675,6 +4676,24 @@ index 0000000..bef339b
 +    assert.equal(box.shown, 'from before the reload');
 +    box.type('!');
 +    assert.deepEqual(saved.state, { other: 1, hunkwiseDrafts: { s1: 'from before the reload!' } }, 'The state of Claude Code itself stays');
++  });
++
++  it('keeps text typed before the chat got its session id when the window reloads', () => {
++    const saved: { state?: any } = {};
++    installWebviewApi(saved);
++    const source = patched(MESSAGE_BOX);
++    let box = runMessageBox(source);
++    const chat = { sessionId: { value: undefined as string | undefined } };
++    box.mount(chat);
++    box.type('typed early');
++    chat.sessionId.value = 's1';
++    box.rerender(chat);
++    assert.equal(box.shown, 'typed early');
++
++    installWebviewApi(saved);
++    box = runMessageBox(source);
++    box.mount({ sessionId: { value: 's1' } });
++    assert.equal(box.shown, 'typed early', 'Saved as soon as the id arrives, not only after the next keystroke');
 +  });
 +
 +  it('is needed: without it the box starts empty', () => {
