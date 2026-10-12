@@ -5,7 +5,11 @@ Claude Code (unlike Copilot or Cursor) doesn't come with a way to accept or disc
 
 This build flips that around, so hunkwise only shows the changes it knows Claude made. Claude Code tells it exactly which file it is about to edit and what the file looked like before and after (through Claude Code hooks), and everything else is accepted silently. On top of that, this build turns itself on in every folder you open, keeps its data in VS Code's own storage (so no `.vscode/hunkwise` folders show up in your projects), and also tracks files in subfolders on Windows (which the original version didn't).
 
+It also makes Claude Code's chats a bit nicer to juggle: text you typed but didn't send stays with its chat when you switch to another one, and you get a notification when a chat waits for you (see [Claude Code chats](#claude-code-chats)).
+
 ## Installation
+To update an earlier install, pull this repo and run the install script again: newer versions can need new Claude Code hooks.
+
 
 ### Windows
 1. Clone this repo anywhere.
@@ -38,15 +42,27 @@ Everything else, like your own typing, a Black formatting run, or a Git discard,
 - To accept or discard all changes in a file (or all files) at once, use the hunkwise panel. The editor title bar also has buttons for the file you're looking at, plus arrows to jump to the previous or next hunk.
 - Files with hunks to review get a purple ✦ badge in the Explorer, and so do the folders they're in, so you can see what Claude changed without opening the hunkwise panel.
 
+## Claude Code chats
+### Unsent text stays with its chat
+Claude Code empties the message box whenever you switch to another chat (in the side bar or in a tab), so a half-written message is gone when you come back. With hunkwise, the text you typed stays with the chat you typed it in, and comes back when you switch back to that chat.
+
+VS Code doesn't let one extension reach into another extension's UI, so hunkwise patches Claude Code's chat UI (`webview/index.js` in Claude Code's extension folder) to do this. It patches every Claude Code version it finds, and also new versions as soon as Claude Code updates itself, before VS Code loads them. The first time, hunkwise asks you to reload VS Code, since the chat UI that's already open doesn't have the patch yet. If an update changes Claude Code's code so much that hunkwise no longer recognizes the message box, hunkwise leaves that version alone: Claude Code then works as usual, just without keeping your text, and the hunkwise log (Output panel > Hunkwise) says so.
+
+### Notifications when a chat waits for you
+When a chat asks you a question, has a plan for you to approve, or asks permission to use a tool, hunkwise shows a notification in the VS Code window of that chat, with the chat's title and an **Open Chat** button that takes you to it. On Windows, when VS Code isn't the app in front, you also get a Windows notification; clicking it brings VS Code to the front with that chat open. The first time you click one, VS Code asks whether hunkwise may open the link; tick the box so it doesn't ask again. Chats that run in a terminal (the `claude` CLI) get a notification too, without a button.
+
 ## Known limitations
 - Files Claude changes through Bash (`sed`, scripts, git) are not shown, including deleted files. Claude Code has no delete tool, and I couldn't find a way to attribute Bash changes to Claude without also catching things you did yourself at the same moment. I'd rather miss those than show false positives.
 - Changes Claude makes while no VS Code window is open are not shown, since there's nothing listening at that point.
 - In a dev container that works on a folder from your Windows drive (the default when you open a local folder in a container), Linux never gets notified when a file changes. VS Code itself has the same problem, so a file that's already open can keep showing its old content until you click it. hunkwise makes up for it by comparing the files it's reviewing with the disk every 2 seconds, and its panel always reads from disk, so Claude's changes still show up there right away. If you want to get rid of the problem entirely, keep the repo inside WSL or in a container volume (**Dev Containers: Clone Repository in Container Volume**), which also makes the container a lot faster.
 - Only files inside the folder you have open in VS Code are tracked. If Claude edits a file somewhere else on your PC (e.g. a config file in your home folder), hunkwise ignores it. This is baked into how hunkwise works: it stores its baselines in a small git repo tied to your workspace folder (and git can't track files outside it), and it only watches that folder for changes. Fixing this would mean a separate storage and file watcher for outside files, plus deciding which VS Code window should show them when you have several open, so I left it out for now.
 - A change of more than about 500 lines (for example when Claude rewrites most of a large file, or changes all of its line endings) shows up as one hunk, from its first to its last changed line. Finding the smaller hunks in there can take seconds, and VS Code (Claude Code included) would freeze in the meantime, see below. For the same reason, if you change more than about 1250 lines yourself in a file that's under review (for example by reformatting it), its review ends: Claude's changes stay in the file, but they're no longer shown as hunks, since hunkwise can't tell them apart from yours anymore.
+- Unsent text is kept until VS Code reloads, and only the text: files and images you attached to a message you didn't send yet are still dropped when you switch chats.
+- A chat that waits for you is announced even when you're already looking at it, since hunkwise can't see which chat Claude Code shows. Permission prompts of subagents are not announced: most subagents run in the background, where Claude Code can't ask you anyway.
+- The notifications only come from the VS Code window whose folder the chat runs in, and Windows notifications only exist on Windows (not on Linux, macOS or in a dev container).
 
 ## How it works (for nerds)
-To know what Claude edits, hunkwise runs a tiny local server on `127.0.0.1:47821` and Claude Code calls it right before and after every Edit/Write/NotebookEdit. The install script registers these hooks in `~/.claude/settings.json`, and your other settings and hooks stay untouched. If VS Code isn't running, the hooks just find nothing listening and Claude Code carries on normally.
+To know what Claude edits, hunkwise runs a tiny local server on `127.0.0.1:47821` and Claude Code calls it right before and after every Edit/Write/NotebookEdit. Claude Code also calls it right before every AskUserQuestion (a question for you) and ExitPlanMode (a plan for you), and for every permission prompt, which is how hunkwise knows a chat waits for you. The install script registers these hooks in `~/.claude/settings.json`, and your other settings and hooks stay untouched. The hooks send the `CLAUDE_CODE_ENTRYPOINT` of the chat along, so hunkwise can tell a chat in VS Code from one in a terminal. If VS Code isn't running, the hooks just find nothing listening and Claude Code carries on normally.
 
 The original hunkwise copies every file in your workspace into a private git repo when you turn it on, so it has something to compare against when any file changes. This build doesn't need that, since the hooks tell it what a file looked like right before Claude changed it. So it only stores the files that are under review, and drops each one again once you've accepted or discarded all its hunks. Turning it on in a big repo costs nothing, and a leftover copy from an older version is cleaned up the next time VS Code starts.
 

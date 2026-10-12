@@ -2,7 +2,7 @@
 # Installs the patched hunkwise extension (auto-enable, no per-folder files, only Claude Code's own
 # edits become hunks) on Linux and macOS, including inside dev containers. It installs the .vsix
 # into every VS Code build it finds, enables the proposed API it needs, and registers the Claude
-# Code hooks that tell hunkwise what Claude edits.
+# Code hooks that tell hunkwise what Claude edits and when a chat waits for you.
 # Run: bash install.sh (install.ps1 is the Windows version of this script).
 set -euo pipefail
 
@@ -10,8 +10,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Must match HOOK_PORT and HOOK_PATH in the extension (src/claudeHooks.ts).
 HOOK_URL='http://127.0.0.1:47821/hunkwise/claude-hook'
-HOOK_EVENTS='PreToolUse PostToolUse PostToolUseFailure PermissionDenied'
-HOOK_MATCHER='Edit|Write|MultiEdit|NotebookEdit'
+FILE_TOOLS='Edit|Write|MultiEdit|NotebookEdit'
+# The tools hunkwise hears about, per hook event. Besides the file tools: AskUserQuestion and
+# ExitPlanMode (a question or a plan for you) and permission prompts mean that a chat waits for you.
+HOOK_MATCHERS=(
+  "PreToolUse=$FILE_TOOLS|AskUserQuestion|ExitPlanMode"
+  "PostToolUse=$FILE_TOOLS"
+  "PostToolUseFailure=$FILE_TOOLS"
+  "PermissionDenied=$FILE_TOOLS"
+  "PermissionRequest=*"
+)
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is needed to update the JSON config files, but it isn't installed." >&2
@@ -52,11 +60,12 @@ PY
 
 # Register hunkwise's hooks in Claude Code's user settings, leaving all other settings and hooks as they are.
 update_claude_settings() {
-  python3 - "$1" "$HOOK_URL" "$HOOK_MATCHER" $HOOK_EVENTS <<'PY'
+  python3 - "$1" "$HOOK_URL" "${HOOK_MATCHERS[@]}" <<'PY'
 import json, sys
 from pathlib import Path
 
-path, url, matcher, events = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4:]
+path, url = Path(sys.argv[1]), sys.argv[2]
+matchers = dict(arg.split("=", 1) for arg in sys.argv[3:])
 original = path.read_text(encoding="utf-8") if path.exists() else None
 try:
     settings = json.loads(original) if original and original.strip() else {}
@@ -78,8 +87,16 @@ for event in list(hooks):
     else:
         del hooks[event]
 
-for event in events:
-    hooks.setdefault(event, []).append({"matcher": matcher, "hooks": [{"type": "http", "url": url, "timeout": 5}]})
+for event, matcher in matchers.items():
+    # The header tells hunkwise whether the chat runs in VS Code (claude-vscode) or in a terminal.
+    entry = {
+        "type": "http",
+        "url": url,
+        "timeout": 5,
+        "headers": {"X-Claude-Entrypoint": "$CLAUDE_CODE_ENTRYPOINT"},
+        "allowedEnvVars": ["CLAUDE_CODE_ENTRYPOINT"],
+    }
+    hooks.setdefault(event, []).append({"matcher": matcher, "hooks": [entry]})
 
 text = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
 if text == original:

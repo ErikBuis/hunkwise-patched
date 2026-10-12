@@ -1,6 +1,7 @@
 # Installs the patched hunkwise extension (auto-enable, no per-folder files, Windows subfolder fix,
 # only Claude Code's own edits become hunks) into every VS Code build found on this PC, enables the
-# proposed API it needs, and registers the Claude Code hooks that tell hunkwise what Claude edits.
+# proposed API it needs, and registers the Claude Code hooks that tell hunkwise what Claude edits
+# and when a chat waits for you.
 # Run: ./install.ps1 from a PowerShell terminal in this folder.
 
 param(
@@ -12,8 +13,16 @@ $ErrorActionPreference = 'Stop'
 
 # Must match HOOK_PORT and HOOK_PATH in the extension (src/claudeHooks.ts).
 $HookUrl = 'http://127.0.0.1:47821/hunkwise/claude-hook'
-$HookEvents = @('PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionDenied')
-$HookMatcher = 'Edit|Write|MultiEdit|NotebookEdit'
+$FileTools = 'Edit|Write|MultiEdit|NotebookEdit'
+# The tools hunkwise hears about, per hook event. Besides the file tools: AskUserQuestion and
+# ExitPlanMode (a question or a plan for you) and permission prompts mean that a chat waits for you.
+$HookMatchers = [ordered]@{
+    PreToolUse         = "$FileTools|AskUserQuestion|ExitPlanMode"
+    PostToolUse        = $FileTools
+    PostToolUseFailure = $FileTools
+    PermissionDenied   = $FileTools
+    PermissionRequest  = '*'
+}
 
 function Write-Utf8NoBom([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))
@@ -73,9 +82,11 @@ function Update-ClaudeSettings([string]$Path) {
         if ($groups.Count -gt 0) { $hooks.($prop.Name) = $groups } else { $hooks.PSObject.Properties.Remove($prop.Name) }
     }
 
-    foreach ($hookEvent in $HookEvents) {
-        $entry = [pscustomobject][ordered]@{ type = 'http'; url = $HookUrl; timeout = 5 }
-        $group = [pscustomobject][ordered]@{ matcher = $HookMatcher; hooks = @($entry) }
+    foreach ($hookEvent in $HookMatchers.Keys) {
+        # The header tells hunkwise whether the chat runs in VS Code (claude-vscode) or in a terminal.
+        $headers = [pscustomobject]@{ 'X-Claude-Entrypoint' = '$CLAUDE_CODE_ENTRYPOINT' }
+        $entry = [pscustomobject][ordered]@{ type = 'http'; url = $HookUrl; timeout = 5; headers = $headers; allowedEnvVars = @('CLAUDE_CODE_ENTRYPOINT') }
+        $group = [pscustomobject][ordered]@{ matcher = $HookMatchers[$hookEvent]; hooks = @($entry) }
         if ($hooks.PSObject.Properties[$hookEvent]) {
             $hooks.$hookEvent = @(@($hooks.$hookEvent) + $group)
         } else {
