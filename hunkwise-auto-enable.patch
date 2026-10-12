@@ -415,10 +415,10 @@ index 0000000..c48743a
 +}
 diff --git a/src/claudeCodeDrafts.ts b/src/claudeCodeDrafts.ts
 new file mode 100644
-index 0000000..41d4475
+index 0000000..9f5d857
 --- /dev/null
 +++ b/src/claudeCodeDrafts.ts
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,156 @@
 +import * as fs from 'fs';
 +import * as path from 'path';
 +import * as vscode from 'vscode';
@@ -429,9 +429,11 @@ index 0000000..41d4475
 +// Folders of installed Claude Code versions, e.g. anthropic.claude-code-2.1.296-win32-x64.
 +const CLAUDE_CODE_DIR = /^anthropic\.claude-code-\d/;
 +// The patch is wrapped in these comments, so that a newer version of it can replace it.
-+const PATCH_BEGIN = '/*hunkwise-drafts-begin:v1*/';
++const PATCH_VERSION = 2;
++const PATCH_BEGIN = `/*hunkwise-drafts-begin:v${PATCH_VERSION}*/`;
 +const PATCH_END = '/*hunkwise-drafts-end*/';
 +const ANY_PATCH = /\/\*hunkwise-drafts-begin:v\d+\*\/[\s\S]*?\/\*hunkwise-drafts-end\*\//;
++const PATCH_VERSION_IN_SOURCE = /\/\*hunkwise-drafts-begin:v(\d+)\*\//;
 +// How far into the message box component its setInputText() and effects are looked for.
 +const COMPONENT_SEARCH_CHARS = 200_000;
 +// How long to wait for more changes in the extensions folder before looking for new Claude Code versions.
@@ -457,7 +459,10 @@ index 0000000..41d4475
 + * Code changed it), the source is left alone.
 + */
 +export function patchChatDrafts(source: string): DraftPatchResult {
-+  if (source.includes(PATCH_BEGIN)) return { kind: 'up-to-date' };
++  // A newer patch comes from a newer hunkwise in another window. Replacing it would make both
++  // windows undo each other's patch over and over, until the older one reloads.
++  const existing = PATCH_VERSION_IN_SOURCE.exec(source);
++  if (existing && Number(existing[1]) >= PATCH_VERSION) return { kind: 'up-to-date' };
 +  source = source.replace(ANY_PATCH, '');
 +
 +  // function({session:S,onSubmit:..,context:..,onListFiles:..,...},ref){h();let[TEXT,setText]=useState(""),...
@@ -465,28 +470,33 @@ index 0000000..41d4475
 +  const matches = [...source.matchAll(component)];
 +  if (matches.length !== 1) return { kind: 'unsupported', reason: `found ${matches.length} message boxes instead of 1` };
 +  const [match, session, text, useState] = matches[0];
-+  const insertAt = matches[0].index! + match.length;
-+  const body = source.slice(insertAt, insertAt + COMPONENT_SEARCH_CHARS);
++  const start = matches[0].index! + match.length;
++  const body = source.slice(start, start + COMPONENT_SEARCH_CHARS);
 +
-+  // useEffect(()=>{if(TEXT==="")S.sentPastes=...},[TEXT,S])
-+  const effect = new RegExp(`([\\w$]+)\\(\\(\\)=>\\{if\\(${escapeRegExp(text)}===""\\)${escapeRegExp(session)}\\.sentPastes=`).exec(body);
++  // useEffect(()=>{if(box.current&&TEXT==="")box.current.textContent=""},[TEXT]) empties the box
++  // (an uncontrolled contenteditable) once TEXT is empty, which it is in a new box. The patch goes
++  // right after it, since effects run in order: the draft has to be put in the box after this.
++  const t = escapeRegExp(text);
++  const clearBox = new RegExp(`([\\w$]+)\\(\\(\\)=>\\{if\\(([\\w$]+)\\.current&&${t}===""\\)\\2\\.current\\.textContent=""\\},\\[${t}\\]\\)`).exec(body);
 +  // setInputText:(t)=>{setInput(t),...}, where setInput is declared in the component itself.
 +  const setInputText = /setInputText:\(([\w$]+)\)=>\{([\w$]+)\(\1\)/.exec(body);
-+  if (!effect) return { kind: 'unsupported', reason: 'useEffect() not found' };
++  if (!clearBox) return { kind: 'unsupported', reason: 'the effect that empties the message box was not found' };
 +  if (!setInputText) return { kind: 'unsupported', reason: 'setInputText() not found' };
-+  const useEffect = effect[1];
++  const useEffect = clearBox[1];
 +  const setInput = setInputText[2];
 +  if (!new RegExp(`[,;{\\s]${escapeRegExp(setInput)}=(?!=)`).test(body.slice(0, setInputText.index))) {
 +    return { kind: 'unsupported', reason: `${setInput}() is not declared in the message box` };
 +  }
 +
-+  // Extra declarations in the component's first let. hwDraft.session is the chat the box shows;
-+  // when it is a different one, its saved draft is put in the box (which also clears it).
++  // One more state and effect after the effect that empties the box. hwDraft.session is the chat
++  // the box shows; when that changes, the new chat's draft goes in the box (and the text of the
++  // previous chat goes out), otherwise every change of the text is saved as the chat's draft.
 +  // try/catch: whatever goes wrong here may never break Claude Code's chat.
-+  const patch = `${PATCH_BEGIN},hwDraft=${useState}({})[0],hwDraftEffect=${useEffect}(()=>{try{`
++  const insertAt = start + clearBox.index + clearBox[0].length;
++  const patch = `${PATCH_BEGIN},(hwDraft=>${useEffect}(()=>{try{`
 +    + `if(hwDraft.session!==${session}){hwDraft.session=${session};let d=${session}.hunkwiseDraft;if(d||${text})${setInput}(d||"")}`
 +    + `else ${session}.hunkwiseDraft=${text}`
-+    + `}catch{}},[${text},${session}])${PATCH_END}`;
++    + `}catch{}},[${text},${session}]))(${useState}({})[0])${PATCH_END}`;
 +  return { kind: 'patched', source: source.slice(0, insertAt) + patch + source.slice(insertAt) };
 +}
 +
@@ -4400,18 +4410,23 @@ index 0000000..ccdd6a4
 +});
 diff --git a/src/test/claudeCodeDrafts.test.ts b/src/test/claudeCodeDrafts.test.ts
 new file mode 100644
-index 0000000..3f9004f
+index 0000000..b80717e
 --- /dev/null
 +++ b/src/test/claudeCodeDrafts.test.ts
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,157 @@
 +import { describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { patchChatDrafts } from '../claudeCodeDrafts';
 +
-+// A message box with the shape of the one in Claude Code's minified chat UI (webview/index.js).
++// A message box with the shape of the one in Claude Code's minified chat UI (webview/index.js):
++// an uncontrolled contenteditable (E1) whose text is mirrored in state (j), an effect that empties
++// it when j is empty, and setInputText() through a2().
 +const MESSAGE_BOX = 'var Box=f0(function({session:J,onSubmit:Z,context:X,onListFiles:Y,attachedFiles:Q},A){X5();'
-+  + 'let[j,N]=x(""),[w,O]=x(null);r(()=>{if(j==="")J.sentPastes=[]},[j,J]);'
-+  + 'let a2=(f1)=>{N(f1)};I21(A,()=>({setInputText:(f1)=>{a2(f1),J.sentPastes=[]}}));return j});';
++  + 'let[j,N]=x(""),[w,O]=x(null),E1=n(null);r(()=>{if(j==="")J.sentPastes=[]},[j,J]);'
++  + 'let a2=q0((f1)=>{if(!E1.current)return;E1.current.textContent=f1,N(f1)},[]);'
++  + 'I21(A,()=>({setInputText:(f1)=>{a2(f1),J.sentPastes=[]}}),[J,a2]),'
++  + 'r(()=>{if(E1.current&&j==="")E1.current.textContent=""},[j]),r(()=>{if(w!==null)O(null)},[j,w]);'
++  + 'return E1});';
 +
 +function patched(source: string): string {
 +  const result = patchChatDrafts(source);
@@ -4420,8 +4435,9 @@ index 0000000..3f9004f
 +}
 +
 +/**
-+ * Runs the message box in source with just enough of React: state, effects that run after a
-+ * render when their dependencies change, and re-renders after a state change.
++ * Runs the message box in source with just enough of React: state, refs (attached to the box's
++ * element before effects run), effects that run in order after a render when their dependencies
++ * change, and re-renders after a state change.
 + */
 +function runMessageBox(source: string) {
 +  let slots: any[] = [];
@@ -4429,10 +4445,16 @@ index 0000000..3f9004f
 +  let effects: (() => void)[] = [];
 +  let stateChanged = false;
 +  let props: { session: object } | undefined;
++  let element = { textContent: '' };
 +  const useState = (initial: unknown) => {
 +    const i = slot++;
 +    if (!(i in slots)) slots[i] = initial;
-+    return [slots[i], (value: unknown) => { slots[i] = value; stateChanged = true; }];
++    return [slots[i], (value: unknown) => { if (slots[i] !== value) { slots[i] = value; stateChanged = true; } }];
++  };
++  const useRef = (initial: unknown) => {
++    const i = slot++;
++    if (!(i in slots)) slots[i] = { current: initial };
++    return slots[i];
 +  };
 +  const useEffect = (effect: () => void, deps: unknown[]) => {
 +    const i = slot++;
@@ -4442,24 +4464,31 @@ index 0000000..3f9004f
 +      effects.push(effect);
 +    }
 +  };
-+  const Box = new Function('f0', 'X5', 'x', 'r', 'I21', `${source}return Box;`)(
-+    (component: unknown) => component, () => undefined, useState, useEffect, () => undefined,
++  const Box = new Function('f0', 'X5', 'x', 'n', 'r', 'q0', 'I21', `${source}return Box;`)(
++    (component: unknown) => component, () => undefined, useState, useRef, useEffect, (fn: unknown) => fn, () => undefined,
 +  );
 +  const render = () => {
 +    do {
 +      stateChanged = false;
 +      slot = 0;
 +      effects = [];
-+      Box(props, null);
++      const box = Box(props, null);
++      box.current = element;
 +      effects.forEach(effect => effect());
 +    } while (stateChanged);
 +  };
 +  return {
 +    /** Show session in a new message box, like Claude Code does when you switch chats. */
-+    mount(session: object) { slots = []; props = { session }; render(); },
++    mount(session: object) { slots = []; element = { textContent: '' }; props = { session }; render(); },
 +    /** Show session in the same message box. */
 +    rerender(session: object) { props = { session }; render(); },
-+    type(text: string) { slots[0] = text; render(); },
++    /** Type text at the end of the box, like the user does. */
++    type(text: string) { element.textContent += text; slots[0] = element.textContent; render(); },
++    /** Empty the box, like sending the message does. */
++    clear() { element.textContent = ''; slots[0] = ''; render(); },
++    /** The text the user sees in the box. */
++    get shown(): string { return element.textContent; },
++    /** The text Claude Code sends. */
 +    get text(): string { return slots[0]; },
 +  };
 +}
@@ -4472,12 +4501,15 @@ index 0000000..3f9004f
 +    box.mount(first);
 +    box.type('half a question');
 +    box.mount(second);
-+    assert.equal(box.text, '', 'A chat without a draft starts empty');
++    assert.equal(box.shown, '', 'A chat without a draft starts empty');
 +    box.type('another one');
 +    box.mount(first);
++    assert.equal(box.shown, 'half a question', 'The draft is in the box itself, not only in the state');
 +    assert.equal(box.text, 'half a question');
++    box.type(', finished');
++    assert.equal(box.text, 'half a question, finished', 'Typing continues the draft');
 +    box.mount(second);
-+    assert.equal(box.text, 'another one');
++    assert.equal(box.shown, 'another one');
 +  });
 +
 +  it('does not bring back text that was sent', () => {
@@ -4485,10 +4517,10 @@ index 0000000..3f9004f
 +    const chat = {};
 +    box.mount(chat);
 +    box.type('a question');
-+    box.type('');
++    box.clear();
 +    box.mount({});
 +    box.mount(chat);
-+    assert.equal(box.text, '');
++    assert.equal(box.shown, '');
 +  });
 +
 +  it('also switches drafts when the same message box shows another chat', () => {
@@ -4498,9 +4530,20 @@ index 0000000..3f9004f
 +    box.mount(first);
 +    box.type('for the first chat');
 +    box.rerender(second);
-+    assert.equal(box.text, '', 'The text does not move to the other chat');
++    assert.equal(box.shown, '', 'The text does not move to the other chat');
 +    box.rerender(first);
++    assert.equal(box.shown, 'for the first chat');
 +    assert.equal(box.text, 'for the first chat');
++  });
++
++  it('is needed: without it the box starts empty', () => {
++    const box = runMessageBox(MESSAGE_BOX);
++    const chat = {};
++    box.mount(chat);
++    box.type('half a question');
++    box.mount({});
++    box.mount(chat);
++    assert.equal(box.shown, '');
 +  });
 +
 +  it('leaves an already patched source alone', () => {
@@ -4508,18 +4551,24 @@ index 0000000..3f9004f
 +  });
 +
 +  it('replaces an older version of the patch', () => {
-+    const old = MESSAGE_BOX.replace('x("")', 'x("")/*hunkwise-drafts-begin:v0*/,old=1/*hunkwise-drafts-end*/');
++    const old = MESSAGE_BOX.replace('x("")', 'x("")/*hunkwise-drafts-begin:v1*/,old=1/*hunkwise-drafts-end*/');
 +    const source = patched(old);
-+    assert.ok(!source.includes('v0'));
++    assert.ok(!source.includes(':v1*/'));
 +    assert.ok(!source.includes('old=1'));
 +    assert.equal(source.split('hunkwise-drafts-begin').length, 2);
++    assert.equal(source.replace(/\/\*hunkwise-drafts-begin[\s\S]*?hunkwise-drafts-end\*\//, ''), MESSAGE_BOX, 'Only the new patch is left');
++  });
++
++  it('leaves a newer version of the patch alone', () => {
++    const newer = MESSAGE_BOX.replace('x("")', 'x("")/*hunkwise-drafts-begin:v99*/,newer=1/*hunkwise-drafts-end*/');
++    assert.equal(patchChatDrafts(newer).kind, 'up-to-date');
 +  });
 +
 +  it('does not patch a source whose message box it does not recognize', () => {
 +    assert.equal(patchChatDrafts('var a=1;').kind, 'unsupported');
 +    assert.equal(patchChatDrafts(MESSAGE_BOX + MESSAGE_BOX).kind, 'unsupported', 'Two message boxes');
 +    assert.equal(patchChatDrafts(MESSAGE_BOX.replace('let a2=', 'let b2=')).kind, 'unsupported', 'setInputText() calls a function from elsewhere');
-+    assert.equal(patchChatDrafts(MESSAGE_BOX.replace('J.sentPastes=[]},[j,J]', 'J.other=[]},[j,J]')).kind, 'unsupported', 'No recognizable useEffect()');
++    assert.equal(patchChatDrafts(MESSAGE_BOX.replace('E1.current.textContent=""', 'E1.current.innerHTML=""')).kind, 'unsupported', 'No effect that empties the box');
 +  });
 +});
 diff --git a/src/test/claudeHooks.test.ts b/src/test/claudeHooks.test.ts
