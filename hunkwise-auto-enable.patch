@@ -1,5 +1,5 @@
 diff --git a/CLAUDE.md b/CLAUDE.md
-index c6abe86..ca92dd0 100644
+index c6abe86..dd97c61 100644
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
 @@ -45,17 +45,19 @@ hunkwise is a VSCode extension that provides per-hunk Accept/Discard controls fo
@@ -12,7 +12,7 @@ index c6abe86..ca92dd0 100644
 -- **Persistence across restarts**: On `activate()`, `StateManager.load()` checks if `.vscode/hunkwise/git/` exists (enabled state), then reads all baselines from `git ls-tree HEAD` + `git show :path`. Files on disk that are not tracked in hunkwise git are detected as new files (`baseline: null`) via `collectUntrackedFiles()`.
 +- **Persistence across restarts**: On `activate()`, `StateManager.load()` checks if `.vscode/hunkwise/git/` exists (enabled state), then reads all baselines from `git ls-tree HEAD` and one `git cat-file --batch` process (`HunkwiseGit.getBaselines()`). Baselines of files whose content matches the disk (no longer under review) are removed from git.
 +- **Never block the extension host**: hunkwise shares its extension host (one Node.js event loop) with every other extension, Claude Code included. Starting a child process blocks it for 10-20 ms on Windows, so never start one per file (batch the git work, see `getBaselines()`, `removeFileBatch()` and `removeBaselines()`). Walk the file system asynchronously (see `FileWatcher.loadGitignore()`), skip work for files that are not under review, and keep diffs bounded: `computeHunks()`, `rebaseBaseline()` and `changedRanges()` give up after a time limit and fall back to coarser results.
-+- **Claude Code chats** (`claudeAttention.ts`, `claudeCodeDrafts.ts`): the hook server also hears when a chat waits for the user (the PreToolUse of `AskUserQuestion` and `ExitPlanMode`, and the PermissionRequest of other tools in the main chat) and shares it as an `attention` event. Each window announces the ones whose `cwd` is in its workspace with a sticky notification and a Windows reminder toast, plus a highlighted taskbar button (FlashWindowEx) while VSCode is not focused; both open the chat through Claude Code's `claude-vscode.editor.open` command. `keepChatDrafts()` patches the `webview/index.js` of every installed Claude Code version (new versions as soon as they appear in the extensions folder) so that each chat keeps the text typed in its message box. Claude Code's source is minified, so `patchChatDrafts()` finds the message box by the shape of its code and leaves the file alone when that shape changed.
++- **Claude Code chats** (`claudeAttention.ts`, `claudeCodeDrafts.ts`): the hook server also hears when a chat waits for the user (the PreToolUse of `AskUserQuestion` and `ExitPlanMode`, and the PermissionRequest of other tools in the main chat) and shares it as an `attention` event. Each window announces the ones whose `cwd` is in its workspace with a Windows reminder toast plus a highlighted taskbar button (FlashWindowEx) while VSCode is not focused, or elsewhere with a sticky VSCode notification; both open the chat through Claude Code's `claude-vscode.editor.open` command. `keepChatDrafts()` patches the `webview/index.js` of every installed Claude Code version (new versions as soon as they appear in the extensions folder) so that each chat keeps the text typed in its message box. Claude Code's source is minified, so `patchChatDrafts()` finds the message box by the shape of its code and leaves the file alone when that shape changed.
  - **Rename/delete handling**: `onWillRenameFiles` migrates state+git before the actual rename; `onDidRenameFiles` triggers UI refresh after. Manual deletes (via VSCode) silently remove the baseline; external deletes produce a deletion hunk.
 -- **Git queue serialization**: All git write operations (`snapshot`, `removeFile`, `renameFile`, `snapshotBatch`) go through `StateManager.gitQueue` to prevent concurrent index/commit operations. Use `stateManager.snapshotFile()` from FileWatcher, never call `git.snapshot()` directly.
 -- **syncIgnoreState**: When `.gitignore` or `ignorePatterns` change, `syncIgnoreState()` both adds newly-allowed files and removes newly-ignored files from the git repo. It awaits the full `gitQueue` before returning.
@@ -240,10 +240,10 @@ index 8ae8760..c75961d 100644
 +}
 diff --git a/src/claudeAttention.ts b/src/claudeAttention.ts
 new file mode 100644
-index 0000000..05d8b59
+index 0000000..fc84ec1
 --- /dev/null
 +++ b/src/claudeAttention.ts
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,241 @@
 +import { execFile } from 'child_process';
 +import * as fs from 'fs';
 +import * as path from 'path';
@@ -402,8 +402,9 @@ index 0000000..05d8b59
 +
 +/**
 + * Lets the user know when a Claude Code chat in this window waits for them, in ways that are hard
-+ * to miss: a VSCode notification and a Windows toast that both stay until clicked and open the
-+ * chat, and a highlighted taskbar button while VSCode is not the app in front.
++ * to miss. On Windows: a Windows toast that stays until clicked and opens the chat, and a
++ * highlighted taskbar button while VSCode is not the app in front. Elsewhere (where there is no
++ * such toast): a VSCode notification that stays until clicked and opens the chat.
 + */
 +export class ClaudeAttentionNotifier implements vscode.UriHandler {
 +  private lastShown = new Map<string, number>();
@@ -422,7 +423,11 @@ index 0000000..05d8b59
 +    const headline = attentionHeadline(event.toolName);
 +    const chatTitle = event.transcriptPath ? await readChatTitle(event.transcriptPath) : undefined;
 +    log(`claude attention: ${event.toolName} in chat ${event.sessionId}`);
-+    if (process.platform === 'win32') void this.notifyWindows(event, headline, chatTitle);
++    // On Windows the Windows notification is enough: a VSCode one as well would be twice the noise.
++    if (process.platform === 'win32') {
++      await this.notifyWindows(event, headline, chatTitle);
++      return;
++    }
 +
 +    const where = chatTitle ? ` in "${chatTitle}"` : '';
 +    const message = event.detail ? `${headline}${where}: ${event.detail}` : `${headline}${where}.`;

@@ -50,9 +50,9 @@ VS Code doesn't let one extension reach into another extension's UI, so hunkwise
 
 ### Notifications when a chat waits for you
 When a chat asks you a question, has a plan for you to approve, or asks permission to use a tool, hunkwise makes sure you notice:
-- A notification in the VS Code window of that chat, with the chat's title and an **Open Chat** button that takes you to it. It stays until you click **Open Chat** or **Dismiss** (VS Code only keeps error notifications open, so it has the red error icon).
-- On Windows, also a Windows notification with a sound, which stays on screen until you click it. **Open Chat** brings VS Code to the front with that chat open. The first time, VS Code asks whether hunkwise may open the link; tick the box so it doesn't ask again.
-- On Windows, when VS Code isn't the app in front, its taskbar button gets a red background (like a chat app with an unread message) until you switch to VS Code.
+- On Windows, a Windows notification with a sound and the chat's title, which stays on screen until you click it. **Open Chat** brings VS Code to the front with that chat open. The first time, VS Code asks whether hunkwise may open the link; tick the box so it doesn't ask again.
+- On Windows, when VS Code isn't the app in front, its taskbar button also gets a red background (like a chat app with an unread message) until you switch to VS Code.
+- On Linux and macOS, which don't get these, a notification in the VS Code window of that chat instead, with an **Open Chat** button. It stays until you click **Open Chat** or **Dismiss** (VS Code only keeps error notifications open, so it has the red error icon).
 
 Chats that run in a terminal (the `claude` CLI) are announced too, but without a way to open them.
 
