@@ -1,5 +1,5 @@
 diff --git a/CLAUDE.md b/CLAUDE.md
-index c6abe86..88edac0 100644
+index c6abe86..ca92dd0 100644
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
 @@ -45,17 +45,19 @@ hunkwise is a VSCode extension that provides per-hunk Accept/Discard controls fo
@@ -12,7 +12,7 @@ index c6abe86..88edac0 100644
 -- **Persistence across restarts**: On `activate()`, `StateManager.load()` checks if `.vscode/hunkwise/git/` exists (enabled state), then reads all baselines from `git ls-tree HEAD` + `git show :path`. Files on disk that are not tracked in hunkwise git are detected as new files (`baseline: null`) via `collectUntrackedFiles()`.
 +- **Persistence across restarts**: On `activate()`, `StateManager.load()` checks if `.vscode/hunkwise/git/` exists (enabled state), then reads all baselines from `git ls-tree HEAD` and one `git cat-file --batch` process (`HunkwiseGit.getBaselines()`). Baselines of files whose content matches the disk (no longer under review) are removed from git.
 +- **Never block the extension host**: hunkwise shares its extension host (one Node.js event loop) with every other extension, Claude Code included. Starting a child process blocks it for 10-20 ms on Windows, so never start one per file (batch the git work, see `getBaselines()`, `removeFileBatch()` and `removeBaselines()`). Walk the file system asynchronously (see `FileWatcher.loadGitignore()`), skip work for files that are not under review, and keep diffs bounded: `computeHunks()`, `rebaseBaseline()` and `changedRanges()` give up after a time limit and fall back to coarser results.
-+- **Claude Code chats** (`claudeAttention.ts`, `claudeCodeDrafts.ts`): the hook server also hears when a chat waits for the user (the PreToolUse of `AskUserQuestion` and `ExitPlanMode`, and the PermissionRequest of other tools in the main chat) and shares it as an `attention` event. Each window announces the ones whose `cwd` is in its workspace with a sticky notification and a Windows reminder toast, plus a red dot on the taskbar icon (ITaskbarList3 overlay) while VSCode is not focused; both open the chat through Claude Code's `claude-vscode.editor.open` command. `keepChatDrafts()` patches the `webview/index.js` of every installed Claude Code version (new versions as soon as they appear in the extensions folder) so that each chat keeps the text typed in its message box. Claude Code's source is minified, so `patchChatDrafts()` finds the message box by the shape of its code and leaves the file alone when that shape changed.
++- **Claude Code chats** (`claudeAttention.ts`, `claudeCodeDrafts.ts`): the hook server also hears when a chat waits for the user (the PreToolUse of `AskUserQuestion` and `ExitPlanMode`, and the PermissionRequest of other tools in the main chat) and shares it as an `attention` event. Each window announces the ones whose `cwd` is in its workspace with a sticky notification and a Windows reminder toast, plus a highlighted taskbar button (FlashWindowEx) while VSCode is not focused; both open the chat through Claude Code's `claude-vscode.editor.open` command. `keepChatDrafts()` patches the `webview/index.js` of every installed Claude Code version (new versions as soon as they appear in the extensions folder) so that each chat keeps the text typed in its message box. Claude Code's source is minified, so `patchChatDrafts()` finds the message box by the shape of its code and leaves the file alone when that shape changed.
  - **Rename/delete handling**: `onWillRenameFiles` migrates state+git before the actual rename; `onDidRenameFiles` triggers UI refresh after. Manual deletes (via VSCode) silently remove the baseline; external deletes produce a deletion hunk.
 -- **Git queue serialization**: All git write operations (`snapshot`, `removeFile`, `renameFile`, `snapshotBatch`) go through `StateManager.gitQueue` to prevent concurrent index/commit operations. Use `stateManager.snapshotFile()` from FileWatcher, never call `git.snapshot()` directly.
 -- **syncIgnoreState**: When `.gitignore` or `ignorePatterns` change, `syncIgnoreState()` both adds newly-allowed files and removes newly-ignored files from the git repo. It awaits the full `gitQueue` before returning.
@@ -240,10 +240,10 @@ index 8ae8760..c75961d 100644
 +}
 diff --git a/src/claudeAttention.ts b/src/claudeAttention.ts
 new file mode 100644
-index 0000000..8b329dc
+index 0000000..05d8b59
 --- /dev/null
 +++ b/src/claudeAttention.ts
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,236 @@
 +import { execFile } from 'child_process';
 +import * as fs from 'fs';
 +import * as path from 'path';
@@ -261,11 +261,10 @@ index 0000000..8b329dc
 +// Windows PowerShell's own app id, for when VSCode's cannot be found.
 +const POWERSHELL_APP_ID = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';
 +
-+// Shows the Windows toast in HUNKWISE_TOAST_XML (when set), and puts a red dot on the taskbar
-+// button of VSCode (HUNKWISE_BADGE=on) or takes it off again (off). The button is the one of the
-+// window of process HUNKWISE_BADGE_PID whose title contains HUNKWISE_BADGE_TITLE. Windows
-+// PowerShell 5.1 can load the WinRT toast API and compile the bit of C# for the badge; everything
-+// comes in through environment variables, so it needs no quoting.
++// Shows the Windows toast in HUNKWISE_TOAST_XML (when set), and highlights the taskbar button of
++// the VSCode window of process HUNKWISE_HIGHLIGHT_PID whose title contains HUNKWISE_HIGHLIGHT_TITLE
++// (when set). Windows PowerShell 5.1 can load the WinRT toast API and compile the bit of C# for the
++// highlight; everything comes in through environment variables, so it needs no quoting.
 +const NOTIFY_SCRIPT = String.raw`
 +$ErrorActionPreference = 'Stop'
 +if ($env:HUNKWISE_TOAST_XML) {
@@ -279,32 +278,21 @@ index 0000000..8b329dc
 +  $toast.ExpirationTime = [DateTimeOffset]::Now.AddMinutes(TOAST_LIFETIME_MINUTES)
 +  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:HUNKWISE_TOAST_APP).Show($toast)
 +}
-+if ($env:HUNKWISE_BADGE) {
-+  Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
++if ($env:HUNKWISE_HIGHLIGHT_PID) {
++  Add-Type -TypeDefinition @'
 +using System;
 +using System.Collections.Generic;
 +using System.Runtime.InteropServices;
 +using System.Text;
 +namespace Hunkwise {
-+  [ComImport, Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-+  public interface ITaskbarList3 {
-+    void HrInit(); void AddTab(IntPtr h); void DeleteTab(IntPtr h); void ActivateTab(IntPtr h); void SetActiveAlt(IntPtr h);
-+    void MarkFullscreenWindow(IntPtr h, bool full);
-+    void SetProgressValue(IntPtr h, ulong done, ulong total); void SetProgressState(IntPtr h, int flags);
-+    void RegisterTab(IntPtr tab, IntPtr main); void UnregisterTab(IntPtr tab); void SetTabOrder(IntPtr tab, IntPtr before);
-+    void SetTabActive(IntPtr tab, IntPtr main, uint reserved);
-+    void ThumbBarAddButtons(IntPtr h, uint n, IntPtr buttons); void ThumbBarUpdateButtons(IntPtr h, uint n, IntPtr buttons);
-+    void ThumbBarSetImageList(IntPtr h, IntPtr images);
-+    void SetOverlayIcon(IntPtr h, IntPtr icon, [MarshalAs(UnmanagedType.LPWStr)] string description);
-+  }
-+  [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090"), ClassInterface(ClassInterfaceType.None)]
-+  public class TaskbarList {}
-+  public static class Badge {
++  public static class Taskbar {
 +    delegate bool EnumProc(IntPtr hwnd, IntPtr param);
 +    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc proc, IntPtr param);
 +    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
 +    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
 +    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int max);
++    [StructLayout(LayoutKind.Sequential)] struct FlashInfo { public uint Size; public IntPtr Hwnd; public uint Flags; public uint Count; public uint Timeout; }
++    [DllImport("user32.dll")] static extern bool FlashWindowEx(ref FlashInfo info);
 +
 +    // The visible window of the process whose title contains title, or its only visible window.
 +    static IntPtr FindWindow(uint pid, string title) {
@@ -320,28 +308,19 @@ index 0000000..8b329dc
 +      return windows.Count == 1 ? windows[0].Key : IntPtr.Zero;
 +    }
 +
-+    public static bool Set(uint pid, string title, bool on) {
++    // Blink the taskbar button once (FLASHW_TRAY): Windows then keeps it highlighted until the
++    // window comes to the front, the same as for an app with an unread message.
++    public static bool Highlight(uint pid, string title) {
 +      IntPtr hwnd = FindWindow(pid, title);
 +      if (hwnd == IntPtr.Zero) return false;
-+      var taskbar = (ITaskbarList3)new TaskbarList();
-+      taskbar.HrInit();
-+      IntPtr icon = IntPtr.Zero;
-+      if (on) {
-+        using (var dot = new System.Drawing.Bitmap(16, 16))
-+        using (var graphics = System.Drawing.Graphics.FromImage(dot)) {
-+          graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-+          graphics.FillEllipse(System.Drawing.Brushes.Red, 1, 1, 14, 14);
-+          // The taskbar keeps its own copy of the icon.
-+          icon = dot.GetHicon();
-+        }
-+      }
-+      taskbar.SetOverlayIcon(hwnd, icon, on ? "Claude waits for you" : "");
-+      return true;
++      var flash = new FlashInfo { Hwnd = hwnd, Flags = 2, Count = 1 };
++      flash.Size = (uint)Marshal.SizeOf(flash);
++      return FlashWindowEx(ref flash);
 +    }
 +  }
 +}
 +'@
-+  [void][Hunkwise.Badge]::Set([uint32]$env:HUNKWISE_BADGE_PID, $env:HUNKWISE_BADGE_TITLE, $env:HUNKWISE_BADGE -eq 'on')
++  [void][Hunkwise.Taskbar]::Highlight([uint32]$env:HUNKWISE_HIGHLIGHT_PID, $env:HUNKWISE_HIGHLIGHT_TITLE)
 +}
 +`.replace('TOAST_LIFETIME_MINUTES', String(TOAST_LIFETIME_MINUTES));
 +
@@ -424,27 +403,13 @@ index 0000000..8b329dc
 +/**
 + * Lets the user know when a Claude Code chat in this window waits for them, in ways that are hard
 + * to miss: a VSCode notification and a Windows toast that both stay until clicked and open the
-+ * chat, and a red dot on VSCode's taskbar button while VSCode is not the app in front.
++ * chat, and a highlighted taskbar button while VSCode is not the app in front.
 + */
-+export class ClaudeAttentionNotifier implements vscode.UriHandler, vscode.Disposable {
++export class ClaudeAttentionNotifier implements vscode.UriHandler {
 +  private lastShown = new Map<string, number>();
 +  private appId: Promise<string> | undefined;
-+  private badged = false;
-+  private readonly windowStateListener: vscode.Disposable;
 +
-+  constructor(private readonly extensionId: string) {
-+    // The red dot goes once the user is back in VSCode.
-+    this.windowStateListener = vscode.window.onDidChangeWindowState(state => {
-+      if (state.focused && this.badged) {
-+        this.badged = false;
-+        this.runWindowsScript({ HUNKWISE_BADGE: 'off', ...this.badgeTarget() });
-+      }
-+    });
-+  }
-+
-+  dispose(): void {
-+    this.windowStateListener.dispose();
-+  }
++  constructor(private readonly extensionId: string) {}
 +
 +  /** Announce a waiting chat, if it runs in a folder of this window. */
 +  async notify(event: ClaudeAttentionEvent): Promise<void> {
@@ -474,7 +439,7 @@ index 0000000..8b329dc
 +    if (sessionId) void openChat(sessionId);
 +  }
 +
-+  /** Show a Windows toast, and put a red dot on the taskbar button when VSCode is not the app in front. */
++  /** Show a Windows toast, and highlight the taskbar button when VSCode is not the app in front. */
 +  private async notifyWindows(event: ClaudeAttentionEvent, headline: string, chatTitle: string | undefined): Promise<void> {
 +    try {
 +      // asExternalUri() adds this window's id, so that VSCode hands the click to this window.
@@ -487,9 +452,11 @@ index 0000000..8b329dc
 +        HUNKWISE_TOAST_TAG: event.sessionId.slice(0, 64),
 +        HUNKWISE_TOAST_APP: await this.windowsAppId(),
 +      };
-+      if (!vscode.window.state.focused) {
-+        this.badged = true;
-+        Object.assign(env, { HUNKWISE_BADGE: 'on', ...this.badgeTarget() });
++      // VSCODE_PID is VSCode's main process, which owns the windows. Windows takes the highlight
++      // off by itself once the window comes to the front.
++      if (!vscode.window.state.focused && process.env.VSCODE_PID) {
++        env.HUNKWISE_HIGHLIGHT_PID = process.env.VSCODE_PID;
++        env.HUNKWISE_HIGHLIGHT_TITLE = vscode.workspace.name ?? '';
 +      }
 +      this.runWindowsScript(env);
 +    } catch (err) {
@@ -497,16 +464,11 @@ index 0000000..8b329dc
 +    }
 +  }
 +
-+  /** The taskbar button of this window: VSCODE_PID is VSCode's main process, which owns the windows. */
-+  private badgeTarget(): NodeJS.ProcessEnv {
-+    return { HUNKWISE_BADGE_PID: process.env.VSCODE_PID ?? '0', HUNKWISE_BADGE_TITLE: vscode.workspace.name ?? '' };
-+  }
-+
 +  /** Run NOTIFY_SCRIPT with the given HUNKWISE_* variables. */
 +  private runWindowsScript(vars: NodeJS.ProcessEnv): void {
 +    const env = { ...process.env, ...vars };
 +    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', NOTIFY_SCRIPT], { env, windowsHide: true, timeout: 30000 }, (err, _stdout, stderr) => {
-+      if (err) log(`claude attention: Windows notification or taskbar dot failed: ${stderr.trim() || err.message}`);
++      if (err) log(`claude attention: Windows notification or taskbar highlight failed: ${stderr.trim() || err.message}`);
 +    });
 +  }
 +
@@ -1965,7 +1927,7 @@ index 96e6c36..9342924 100644
 +  }
 +}
 diff --git a/src/extension.ts b/src/extension.ts
-index d78cdf8..8744187 100644
+index d78cdf8..b64aef7 100644
 --- a/src/extension.ts
 +++ b/src/extension.ts
 @@ -5,15 +5,19 @@ import { StateManager } from './stateManager';
@@ -2015,7 +1977,7 @@ index d78cdf8..8744187 100644
 +  // Tell the user when a chat waits for them, and keep what they type in each chat.
 +  const attentionNotifier = new ClaudeAttentionNotifier(context.extension.id);
 +  fileWatcher.onClaudeAttention = event => { void attentionNotifier.notify(event); };
-+  context.subscriptions.push(attentionNotifier, vscode.window.registerUriHandler(attentionNotifier));
++  context.subscriptions.push(vscode.window.registerUriHandler(attentionNotifier));
 +  keepChatDrafts(context);
 +
    try {
