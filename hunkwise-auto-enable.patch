@@ -240,10 +240,10 @@ index 8ae8760..c75961d 100644
 +}
 diff --git a/src/claudeAttention.ts b/src/claudeAttention.ts
 new file mode 100644
-index 0000000..c48743a
+index 0000000..b85b5a8
 --- /dev/null
 +++ b/src/claudeAttention.ts
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,219 @@
 +import { execFile } from 'child_process';
 +import * as fs from 'fs';
 +import * as path from 'path';
@@ -261,20 +261,57 @@ index 0000000..c48743a
 +// Windows PowerShell's own app id, for when VSCode's cannot be found.
 +const POWERSHELL_APP_ID = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';
 +
-+// Shows the Windows toast in HUNKWISE_TOAST_XML. Windows PowerShell 5.1 can load the WinRT API
-+// that does this; the toast comes in through environment variables, so it needs no quoting.
-+const TOAST_SCRIPT = [
-+  "$ErrorActionPreference = 'Stop'",
-+  '[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]',
-+  '[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]',
-+  '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument',
-+  '$xml.LoadXml($env:HUNKWISE_TOAST_XML)',
-+  '$toast = New-Object Windows.UI.Notifications.ToastNotification $xml',
-+  '$toast.Tag = $env:HUNKWISE_TOAST_TAG',
-+  "$toast.Group = 'hunkwise'",
-+  `$toast.ExpirationTime = [DateTimeOffset]::Now.AddMinutes(${TOAST_LIFETIME_MINUTES})`,
-+  '[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:HUNKWISE_TOAST_APP).Show($toast)',
-+].join('; ');
++// Shows the Windows toast in HUNKWISE_TOAST_XML, and flashes the taskbar button of the VSCode
++// window of process HUNKWISE_FLASH_PID whose title contains HUNKWISE_FLASH_TITLE, until that
++// window comes to the front. Windows PowerShell 5.1 can load the WinRT toast API; everything comes
++// in through environment variables, so it needs no quoting.
++const NOTIFY_SCRIPT = String.raw`
++$ErrorActionPreference = 'Stop'
++if ($env:HUNKWISE_TOAST_XML) {
++  [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
++  [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
++  $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
++  $xml.LoadXml($env:HUNKWISE_TOAST_XML)
++  $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
++  $toast.Tag = $env:HUNKWISE_TOAST_TAG
++  $toast.Group = 'hunkwise'
++  $toast.ExpirationTime = [DateTimeOffset]::Now.AddMinutes(TOAST_LIFETIME_MINUTES)
++  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:HUNKWISE_TOAST_APP).Show($toast)
++}
++if ($env:HUNKWISE_FLASH_PID) {
++  Add-Type -Namespace Hunkwise -Name Win -MemberDefinition @'
++public delegate bool EnumProc(System.IntPtr hwnd, System.IntPtr param);
++[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc proc, System.IntPtr param);
++[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hwnd, out uint pid);
++[DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hwnd);
++[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(System.IntPtr hwnd, System.Text.StringBuilder text, int max);
++[StructLayout(LayoutKind.Sequential)] public struct FlashInfo { public uint Size; public System.IntPtr Hwnd; public uint Flags; public uint Count; public uint Timeout; }
++[DllImport("user32.dll")] public static extern bool FlashWindowEx(ref FlashInfo info);
++'@
++  $windows = New-Object System.Collections.ArrayList
++  [void][Hunkwise.Win]::EnumWindows([Hunkwise.Win+EnumProc]{
++    param($hwnd, $param)
++    [uint32]$owner = 0
++    [void][Hunkwise.Win]::GetWindowThreadProcessId($hwnd, [ref]$owner)
++    if ($owner -eq [uint32]$env:HUNKWISE_FLASH_PID -and [Hunkwise.Win]::IsWindowVisible($hwnd)) {
++      $text = New-Object System.Text.StringBuilder 512
++      [void][Hunkwise.Win]::GetWindowText($hwnd, $text, 512)
++      if ($text.Length -gt 0) { [void]$windows.Add(@{ Hwnd = $hwnd; Title = $text.ToString() }) }
++    }
++    $true
++  }, [IntPtr]::Zero)
++  $window = @($windows | Where-Object { $_.Title.Contains($env:HUNKWISE_FLASH_TITLE) })[0]
++  if (-not $window -and $windows.Count -eq 1) { $window = $windows[0] }
++  if ($window) {
++    $info = New-Object Hunkwise.Win+FlashInfo
++    $info.Size = [Runtime.InteropServices.Marshal]::SizeOf($info)
++    $info.Hwnd = $window.Hwnd
++    # FLASHW_ALL | FLASHW_TIMERNOFG: flash the title bar and taskbar button until the window is in front.
++    $info.Flags = 15
++    [void][Hunkwise.Win]::FlashWindowEx([ref]$info)
++  }
++}
++`.replace('TOAST_LIFETIME_MINUTES', String(TOAST_LIFETIME_MINUTES));
 +
 +/** What a waiting chat waits for, e.g. "Claude has a question". */
 +export function attentionHeadline(toolName: string): string {
@@ -321,11 +358,16 @@ index 0000000..c48743a
 +  return text.replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[c]!);
 +}
 +
-+/** The XML of a Windows toast that opens launchUri when clicked. */
-+export function toastXml(title: string, body: string, attribution: string | undefined, launchUri: string): string {
++/**
++ * The XML of a Windows toast that opens launchUri when clicked. It is a reminder: it stays on
++ * screen until the user clicks it or one of its buttons (openLabel, which opens launchUri, or Dismiss).
++ */
++export function toastXml(title: string, body: string, attribution: string | undefined, launchUri: string, openLabel: string): string {
 +  const lines = [title, body].filter(Boolean).map(text => `<text>${xmlEscape(text)}</text>`).join('');
 +  const attributionXml = attribution ? `<text placement="attribution">${xmlEscape(attribution)}</text>` : '';
-+  return `<toast activationType="protocol" launch="${xmlEscape(launchUri)}"><visual><binding template="ToastGeneric">${lines}${attributionXml}</binding></visual></toast>`;
++  const actions = `<actions><action content="${xmlEscape(openLabel)}" activationType="protocol" arguments="${xmlEscape(launchUri)}"/>`
++    + '<action content="Dismiss" activationType="system" arguments="dismiss"/></actions>';
++  return `<toast scenario="reminder" activationType="protocol" launch="${xmlEscape(launchUri)}"><visual><binding template="ToastGeneric">${lines}${attributionXml}</binding></visual>${actions}</toast>`;
 +}
 +
 +/** Whether dir is (inside) one of the folders open in this window. */
@@ -348,8 +390,9 @@ index 0000000..c48743a
 +}
 +
 +/**
-+ * Lets the user know when a Claude Code chat in this window waits for them: with a VSCode
-+ * notification, plus a Windows toast when VSCode is not the app in front. Both open the chat.
++ * Lets the user know when a Claude Code chat in this window waits for them, in ways that are hard
++ * to miss: a VSCode notification and a Windows toast that both stay until clicked and open the
++ * chat, and a flashing taskbar button when VSCode is not the app in front.
 + */
 +export class ClaudeAttentionNotifier implements vscode.UriHandler {
 +  private lastShown = new Map<string, number>();
@@ -368,13 +411,14 @@ index 0000000..c48743a
 +    const headline = attentionHeadline(event.toolName);
 +    const chatTitle = event.transcriptPath ? await readChatTitle(event.transcriptPath) : undefined;
 +    log(`claude attention: ${event.toolName} in chat ${event.sessionId}`);
-+    if (process.platform === 'win32' && !vscode.window.state.focused) void this.showToast(event, headline, chatTitle);
++    if (process.platform === 'win32') void this.notifyWindows(event, headline, chatTitle);
 +
 +    const where = chatTitle ? ` in "${chatTitle}"` : '';
 +    const message = event.detail ? `${headline}${where}: ${event.detail}` : `${headline}${where}.`;
-+    // A chat in a terminal cannot be opened from here.
-+    const choice = await vscode.window.showInformationMessage(message, ...(event.inExtension ? ['Open Chat'] : []));
-+    if (choice) await openChat(event.sessionId);
++    // VSCode only keeps error notifications with buttons open until they are clicked. A chat in a
++    // terminal cannot be opened from here.
++    const choice = await vscode.window.showErrorMessage(message, ...(event.inExtension ? ['Open Chat', 'Dismiss'] : ['Dismiss']));
++    if (choice === 'Open Chat') await openChat(event.sessionId);
 +  }
 +
 +  /** Opens the chat of a clicked toast. VSCode brings this window to the front itself. */
@@ -384,20 +428,26 @@ index 0000000..c48743a
 +    if (sessionId) void openChat(sessionId);
 +  }
 +
-+  private async showToast(event: ClaudeAttentionEvent, headline: string, chatTitle: string | undefined): Promise<void> {
++  /** Show a Windows toast, and flash the taskbar button when VSCode is not the app in front. */
++  private async notifyWindows(event: ClaudeAttentionEvent, headline: string, chatTitle: string | undefined): Promise<void> {
 +    try {
 +      // asExternalUri() adds this window's id, so that VSCode hands the click to this window.
 +      const query = event.inExtension ? `chat=${encodeURIComponent(event.sessionId)}` : '';
 +      const uri = vscode.Uri.parse(`${vscode.env.uriScheme}://${this.extensionId}${OPEN_CHAT_PATH}`).with({ query });
 +      const launch = await vscode.env.asExternalUri(uri);
-+      const env = {
++      const env: NodeJS.ProcessEnv = {
 +        ...process.env,
-+        HUNKWISE_TOAST_XML: toastXml(headline, event.detail, chatTitle, launch.toString(true)),
++        HUNKWISE_TOAST_XML: toastXml(headline, event.detail, chatTitle, launch.toString(true), event.inExtension ? 'Open Chat' : 'Show VS Code'),
 +        // A new toast for the same chat replaces the previous one.
 +        HUNKWISE_TOAST_TAG: event.sessionId.slice(0, 64),
 +        HUNKWISE_TOAST_APP: await this.windowsAppId(),
 +      };
-+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', TOAST_SCRIPT], { env, windowsHide: true, timeout: 30000 }, (err, _stdout, stderr) => {
++      // VSCODE_PID is VSCode's main process, which owns the windows.
++      if (!vscode.window.state.focused && process.env.VSCODE_PID) {
++        env.HUNKWISE_FLASH_PID = process.env.VSCODE_PID;
++        env.HUNKWISE_FLASH_TITLE = vscode.workspace.name ?? '';
++      }
++      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', NOTIFY_SCRIPT], { env, windowsHide: true, timeout: 30000 }, (err, _stdout, stderr) => {
 +        if (err) log(`claude attention: cannot show a Windows notification: ${stderr.trim() || err.message}`);
 +      });
 +    } catch (err) {
@@ -415,10 +465,10 @@ index 0000000..c48743a
 +}
 diff --git a/src/claudeCodeDrafts.ts b/src/claudeCodeDrafts.ts
 new file mode 100644
-index 0000000..9f5d857
+index 0000000..8938366
 --- /dev/null
 +++ b/src/claudeCodeDrafts.ts
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,169 @@
 +import * as fs from 'fs';
 +import * as path from 'path';
 +import * as vscode from 'vscode';
@@ -429,13 +479,15 @@ index 0000000..9f5d857
 +// Folders of installed Claude Code versions, e.g. anthropic.claude-code-2.1.296-win32-x64.
 +const CLAUDE_CODE_DIR = /^anthropic\.claude-code-\d/;
 +// The patch is wrapped in these comments, so that a newer version of it can replace it.
-+const PATCH_VERSION = 2;
++const PATCH_VERSION = 3;
 +const PATCH_BEGIN = `/*hunkwise-drafts-begin:v${PATCH_VERSION}*/`;
 +const PATCH_END = '/*hunkwise-drafts-end*/';
-+const ANY_PATCH = /\/\*hunkwise-drafts-begin:v\d+\*\/[\s\S]*?\/\*hunkwise-drafts-end\*\//;
++const ANY_PATCH = /\/\*hunkwise-drafts-begin:v\d+\*\/[\s\S]*?\/\*hunkwise-drafts-end\*\//g;
 +const PATCH_VERSION_IN_SOURCE = /\/\*hunkwise-drafts-begin:v(\d+)\*\//;
 +// How far into the message box component its setInputText() and effects are looked for.
 +const COMPONENT_SEARCH_CHARS = 200_000;
++// How many chats keep a draft that survives a reload (the ones typed in last).
++const MAX_SAVED_DRAFTS = 50;
 +// How long to wait for more changes in the extensions folder before looking for new Claude Code versions.
 +const RESCAN_DELAY_MS = 3000;
 +
@@ -452,7 +504,8 @@ index 0000000..9f5d857
 + * Patch the source of Claude Code's chat UI (its webview/index.js) so that every chat keeps what
 + * was typed in its message box. Claude Code renders a new, empty message box for every chat it
 + * shows. The patch saves the box's text on the chat's session object whenever it changes, and
-+ * puts it back when the box is rendered for that chat again.
++ * puts it back when the box is rendered for that chat again. It also saves the text in the
++ * webview's state (by session id), which VSCode keeps when the window reloads.
 + *
 + * The source is minified, so the patch finds the message box component by the shape of its
 + * code and takes the names of its variables from there. When that shape is not found (Claude
@@ -488,16 +541,26 @@ index 0000000..9f5d857
 +    return { kind: 'unsupported', reason: `${setInput}() is not declared in the message box` };
 +  }
 +
++  // The webview may call acquireVsCodeApi() only once, and Claude Code does. This makes later calls
++  // return that same api, so that the patch can use the webview's state too.
++  const shareApi = `${PATCH_BEGIN}(()=>{let a=globalThis.acquireVsCodeApi,i;if(typeof a=="function")globalThis.acquireVsCodeApi=()=>i??=a()})();${PATCH_END}`;
++
 +  // One more state and effect after the effect that empties the box. hwDraft.session is the chat
-+  // the box shows; when that changes, the new chat's draft goes in the box (and the text of the
-+  // previous chat goes out), otherwise every change of the text is saved as the chat's draft.
++  // the box shows and hwDraft.id its session id (which a new chat only gets later). When the chat
++  // changes, its draft goes in the box (and the text of the previous chat goes out); when only the
++  // id arrives, a saved draft goes in an empty box; otherwise every change of the text is saved as
++  // the chat's draft, on the session and in the webview state (s.hunkwiseDrafts, by session id).
 +  // try/catch: whatever goes wrong here may never break Claude Code's chat.
++  const S = session;
 +  const insertAt = start + clearBox.index + clearBox[0].length;
 +  const patch = `${PATCH_BEGIN},(hwDraft=>${useEffect}(()=>{try{`
-+    + `if(hwDraft.session!==${session}){hwDraft.session=${session};let d=${session}.hunkwiseDraft;if(d||${text})${setInput}(d||"")}`
-+    + `else ${session}.hunkwiseDraft=${text}`
-+    + `}catch{}},[${text},${session}]))(${useState}({})[0])${PATCH_END}`;
-+  return { kind: 'patched', source: source.slice(0, insertAt) + patch + source.slice(insertAt) };
++    + `let k=${S}.sessionId?.value,api=globalThis.acquireVsCodeApi?.(),s=api?.getState()||{},m=s.hunkwiseDrafts||{};`
++    + `if(hwDraft.session!==${S}||hwDraft.id!==k){let isNew=hwDraft.session!==${S};hwDraft.session=${S};hwDraft.id=k;`
++    + `let d=${S}.hunkwiseDraft??(k?m[k]:void 0);if(isNew?d||${text}:d&&!${text})${setInput}(d||"")}`
++    + `else{${S}.hunkwiseDraft=${text};if(api&&k&&(m[k]||"")!==${text}){m={...m};delete m[k];if(${text})m[k]=${text};`
++    + `let ks=Object.keys(m);if(ks.length>${MAX_SAVED_DRAFTS})delete m[ks[0]];api.setState({...api.getState(),hunkwiseDrafts:m})}}`
++    + `}catch{}},[${text},${S},${S}.sessionId?.value]))(${useState}({})[0])${PATCH_END}`;
++  return { kind: 'patched', source: shareApi + source.slice(0, insertAt) + patch + source.slice(insertAt) };
 +}
 +
 +/** Patch one installed Claude Code version. Returns whether its chat UI was changed. */
@@ -4345,10 +4408,10 @@ index 0000000..24ff5c2
 +});
 diff --git a/src/test/claudeAttention.test.ts b/src/test/claudeAttention.test.ts
 new file mode 100644
-index 0000000..ccdd6a4
+index 0000000..b6143ac
 --- /dev/null
 +++ b/src/test/claudeAttention.test.ts
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,66 @@
 +import { describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import * as fs from 'fs';
@@ -4397,24 +4460,31 @@ index 0000000..ccdd6a4
 +
 +describe('toastXml', () => {
 +  it('escapes the text and the link', () => {
-+    const xml = toastXml('Claude has a question', 'Use <b> & "quotes"?', 'Chat & co', 'vscode://molon.hunkwise/open-chat?chat=1&windowId=2');
++    const xml = toastXml('Claude has a question', 'Use <b> & "quotes"?', 'Chat & co', 'vscode://molon.hunkwise/open-chat?chat=1&windowId=2', 'Open Chat');
 +    assert.ok(xml.includes('<text>Use &lt;b&gt; &amp; &quot;quotes&quot;?</text>'));
 +    assert.ok(xml.includes('<text placement="attribution">Chat &amp; co</text>'));
 +    assert.ok(xml.includes('launch="vscode://molon.hunkwise/open-chat?chat=1&amp;windowId=2"'));
 +  });
 +
++  it('stays on screen until a button is clicked', () => {
++    const xml = toastXml('Claude needs your permission', '', undefined, 'vscode://x/y', 'Show VS Code');
++    assert.ok(xml.startsWith('<toast scenario="reminder"'));
++    assert.ok(xml.includes('<action content="Show VS Code" activationType="protocol" arguments="vscode://x/y"/>'));
++    assert.ok(xml.includes('<action content="Dismiss" activationType="system" arguments="dismiss"/>'));
++  });
++
 +  it('leaves out an empty body and a missing chat title', () => {
-+    const xml = toastXml('Claude needs your permission', '', undefined, 'vscode://x/y');
++    const xml = toastXml('Claude needs your permission', '', undefined, 'vscode://x/y', 'Open Chat');
 +    assert.equal(xml.match(/<text/g)?.length, 1);
 +  });
 +});
 diff --git a/src/test/claudeCodeDrafts.test.ts b/src/test/claudeCodeDrafts.test.ts
 new file mode 100644
-index 0000000..b80717e
+index 0000000..bef339b
 --- /dev/null
 +++ b/src/test/claudeCodeDrafts.test.ts
-@@ -0,0 +1,157 @@
-+import { describe, it } from 'node:test';
+@@ -0,0 +1,206 @@
++import { beforeEach, describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { patchChatDrafts } from '../claudeCodeDrafts';
 +
@@ -4427,6 +4497,18 @@ index 0000000..b80717e
 +  + 'I21(A,()=>({setInputText:(f1)=>{a2(f1),J.sentPastes=[]}}),[J,a2]),'
 +  + 'r(()=>{if(E1.current&&j==="")E1.current.textContent=""},[j]),r(()=>{if(w!==null)O(null)},[j,w]);'
 +  + 'return E1});';
++
++declare const globalThis: { acquireVsCodeApi?: () => unknown };
++
++/** Install a webview api like VSCode's: it can be acquired once, and its state outlives a reload. */
++function installWebviewApi(saved: { state?: any }): void {
++  let acquired = false;
++  globalThis.acquireVsCodeApi = () => {
++    if (acquired) throw new Error('An instance of the VS Code API has already been acquired');
++    acquired = true;
++    return { getState: () => saved.state, setState: (state: unknown) => { saved.state = state; } };
++  };
++}
 +
 +function patched(source: string): string {
 +  const result = patchChatDrafts(source);
@@ -4464,7 +4546,8 @@ index 0000000..b80717e
 +      effects.push(effect);
 +    }
 +  };
-+  const Box = new Function('f0', 'X5', 'x', 'n', 'r', 'q0', 'I21', `${source}return Box;`)(
++  // Like Claude Code, acquire the webview api once at startup.
++  const Box = new Function('f0', 'X5', 'x', 'n', 'r', 'q0', 'I21', `${source}acquireVsCodeApi();return Box;`)(
 +    (component: unknown) => component, () => undefined, useState, useRef, useEffect, (fn: unknown) => fn, () => undefined,
 +  );
 +  const render = () => {
@@ -4494,6 +4577,8 @@ index 0000000..b80717e
 +}
 +
 +describe('patchChatDrafts', () => {
++  beforeEach(() => installWebviewApi({}));
++
 +  it('keeps the text of each chat when switching between chats', () => {
 +    const box = runMessageBox(patched(MESSAGE_BOX));
 +    const first = {};
@@ -4536,6 +4621,40 @@ index 0000000..b80717e
 +    assert.equal(box.text, 'for the first chat');
 +  });
 +
++  it('keeps the drafts when the window reloads', () => {
++    const saved: { state?: any } = {};
++    installWebviewApi(saved);
++    const source = patched(MESSAGE_BOX);
++    let box = runMessageBox(source);
++    box.mount({ sessionId: { value: 's1' } });
++    box.type('half a question');
++    box.mount({ sessionId: { value: 's2' } });
++    box.type('sent');
++    box.clear();
++
++    installWebviewApi(saved);
++    box = runMessageBox(source);
++    box.mount({ sessionId: { value: 's1' } });
++    assert.equal(box.shown, 'half a question', 'A new session object for the same chat gets its draft');
++    box.mount({ sessionId: { value: 's2' } });
++    assert.equal(box.shown, '');
++    assert.deepEqual(Object.keys(saved.state.hunkwiseDrafts), ['s1'], 'Sent text is not kept');
++  });
++
++  it('puts a saved draft back when the chat only gets its session id after showing', () => {
++    const saved: { state?: any } = { state: { other: 1, hunkwiseDrafts: { s1: 'from before the reload' } } };
++    installWebviewApi(saved);
++    const box = runMessageBox(patched(MESSAGE_BOX));
++    const chat = { sessionId: { value: undefined as string | undefined } };
++    box.mount(chat);
++    assert.equal(box.shown, '');
++    chat.sessionId.value = 's1';
++    box.rerender(chat);
++    assert.equal(box.shown, 'from before the reload');
++    box.type('!');
++    assert.deepEqual(saved.state, { other: 1, hunkwiseDrafts: { s1: 'from before the reload!' } }, 'The state of Claude Code itself stays');
++  });
++
 +  it('is needed: without it the box starts empty', () => {
 +    const box = runMessageBox(MESSAGE_BOX);
 +    const chat = {};
@@ -4555,8 +4674,8 @@ index 0000000..b80717e
 +    const source = patched(old);
 +    assert.ok(!source.includes(':v1*/'));
 +    assert.ok(!source.includes('old=1'));
-+    assert.equal(source.split('hunkwise-drafts-begin').length, 2);
-+    assert.equal(source.replace(/\/\*hunkwise-drafts-begin[\s\S]*?hunkwise-drafts-end\*\//, ''), MESSAGE_BOX, 'Only the new patch is left');
++    assert.equal(source.split('hunkwise-drafts-begin').length, 3, 'The new patch has two parts');
++    assert.equal(source.replace(/\/\*hunkwise-drafts-begin[\s\S]*?hunkwise-drafts-end\*\//g, ''), MESSAGE_BOX, 'Only the new patch is left');
 +  });
 +
 +  it('leaves a newer version of the patch alone', () => {
