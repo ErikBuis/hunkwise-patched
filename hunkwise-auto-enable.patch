@@ -490,11 +490,10 @@ new file mode 100644
 index 0000000..d22ba83
 --- /dev/null
 +++ b/src/claudeCodeDrafts.ts
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,159 @@
 +import * as fs from 'fs';
 +import * as path from 'path';
 +import * as vscode from 'vscode';
-+import { pathKey } from './claudeHooks';
 +import { log } from './log';
 +
 +const CLAUDE_CODE_ID = 'anthropic.claude-code';
@@ -586,23 +585,23 @@ index 0000000..d22ba83
 +  return { kind: 'patched', source: shareApi + source.slice(0, insertAt) + patch + source.slice(insertAt) };
 +}
 +
-+/** Patch one installed Claude Code version. Returns whether its chat UI was changed. */
-+async function patchInstalledVersion(extensionDir: string, unsupported: Set<string>): Promise<boolean> {
++/** Patch one installed Claude Code version. */
++async function patchInstalledVersion(extensionDir: string, unsupported: Set<string>): Promise<void> {
 +  const file = path.join(extensionDir, 'webview', 'index.js');
 +  let source: string;
 +  try {
 +    // latin1 round-trips every byte, whatever the encoding.
 +    source = await fs.promises.readFile(file, 'latin1');
 +  } catch {
-+    return false;
++    return;
 +  }
 +  const result = patchChatDrafts(source);
-+  if (result.kind === 'up-to-date') return false;
++  if (result.kind === 'up-to-date') return;
 +  const name = path.basename(extensionDir);
 +  if (result.kind === 'unsupported') {
 +    if (!unsupported.has(name)) log(`chat drafts: cannot patch ${name}, so its chats do not keep drafts: ${result.reason}`);
 +    unsupported.add(name);
-+    return false;
++    return;
 +  }
 +  // Several windows can do this at the same time: each writes its own temporary file.
 +  const tmp = `${file}.hunkwise-${process.pid}.tmp`;
@@ -612,10 +611,9 @@ index 0000000..d22ba83
 +  } catch (err) {
 +    log(`chat drafts: cannot patch ${name}: ${err}`);
 +    await fs.promises.rm(tmp, { force: true }).catch(() => undefined);
-+    return false;
++    return;
 +  }
 +  log(`chat drafts: patched ${name}`);
-+  return true;
 +}
 +
 +/**
@@ -624,12 +622,11 @@ index 0000000..d22ba83
 + * before VSCode loads them.
 + */
 +export function keepChatDrafts(context: vscode.ExtensionContext): void {
-+  const running = vscode.extensions.getExtension(CLAUDE_CODE_ID)?.extensionPath;
-+  const extensionsDir = path.dirname(running ?? context.extensionPath);
++  const extensionsDir = path.dirname(vscode.extensions.getExtension(CLAUDE_CODE_ID)?.extensionPath ?? context.extensionPath);
 +  const unsupported = new Set<string>();
 +  let timer: NodeJS.Timeout | undefined;
 +
-+  const patchAll = async (startup: boolean) => {
++  const patchAll = async () => {
 +    let names: string[];
 +    try {
 +      names = await fs.promises.readdir(extensionsDir);
@@ -637,23 +634,15 @@ index 0000000..d22ba83
 +      return;
 +    }
 +    for (const name of names.filter(n => CLAUDE_CODE_DIR.test(n))) {
-+      const dir = path.join(extensionsDir, name);
-+      const patched = await patchInstalledVersion(dir, unsupported);
-+      // The running version's chat UI may already be loaded without the patch.
-+      if (patched && startup && running && pathKey(dir) === pathKey(running)) {
-+        void vscode.window.showInformationMessage(
-+          'hunkwise: Claude Code now keeps what you type in each chat when you switch chats. Reload VS Code to start using it.',
-+          'Reload Window',
-+        ).then(choice => choice && vscode.commands.executeCommand('workbench.action.reloadWindow'));
-+      }
++      await patchInstalledVersion(path.join(extensionsDir, name), unsupported);
 +    }
 +  };
 +
-+  void patchAll(true);
++  void patchAll();
 +  try {
 +    const watcher = fs.watch(extensionsDir, { persistent: false }, () => {
 +      clearTimeout(timer);
-+      timer = setTimeout(() => { void patchAll(false); }, RESCAN_DELAY_MS);
++      timer = setTimeout(() => { void patchAll(); }, RESCAN_DELAY_MS);
 +    });
 +    watcher.on('error', err => log(`chat drafts: stopped watching ${extensionsDir}: ${err}`));
 +    context.subscriptions.push({ dispose: () => { watcher.close(); clearTimeout(timer); } });
