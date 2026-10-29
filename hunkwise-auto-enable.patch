@@ -240,10 +240,10 @@ index 8ae8760..c75961d 100644
 +}
 diff --git a/src/claudeAttention.ts b/src/claudeAttention.ts
 new file mode 100644
-index 0000000..fc84ec1
+index 0000000..6e39a13
 --- /dev/null
 +++ b/src/claudeAttention.ts
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,240 @@
 +import { execFile } from 'child_process';
 +import * as fs from 'fs';
 +import * as path from 'path';
@@ -371,12 +371,12 @@ index 0000000..fc84ec1
 +
 +/**
 + * The XML of a Windows toast that opens launchUri when clicked. It is a reminder: it stays on
-+ * screen until the user clicks it or one of its buttons (openLabel, which opens launchUri, or Dismiss).
++ * screen until the user clicks it or one of its buttons (Open Chat, which opens launchUri, or Dismiss).
 + */
-+export function toastXml(title: string, body: string, attribution: string | undefined, launchUri: string, openLabel: string): string {
++export function toastXml(title: string, body: string, attribution: string | undefined, launchUri: string): string {
 +  const lines = [title, body].filter(Boolean).map(text => `<text>${xmlEscape(text)}</text>`).join('');
 +  const attributionXml = attribution ? `<text placement="attribution">${xmlEscape(attribution)}</text>` : '';
-+  const actions = `<actions><action content="${xmlEscape(openLabel)}" activationType="protocol" arguments="${xmlEscape(launchUri)}"/>`
++  const actions = `<actions><action content="Open Chat" activationType="protocol" arguments="${xmlEscape(launchUri)}"/>`
 +    + '<action content="Dismiss" activationType="system" arguments="dismiss"/></actions>';
 +  return `<toast scenario="reminder" activationType="protocol" launch="${xmlEscape(launchUri)}"><visual><binding template="ToastGeneric">${lines}${attributionXml}</binding></visual>${actions}</toast>`;
 +}
@@ -431,9 +431,8 @@ index 0000000..fc84ec1
 +
 +    const where = chatTitle ? ` in "${chatTitle}"` : '';
 +    const message = event.detail ? `${headline}${where}: ${event.detail}` : `${headline}${where}.`;
-+    // VSCode only keeps error notifications with buttons open until they are clicked. A chat in a
-+    // terminal cannot be opened from here.
-+    const choice = await vscode.window.showErrorMessage(message, ...(event.inExtension ? ['Open Chat', 'Dismiss'] : ['Dismiss']));
++    // VSCode only keeps error notifications with buttons open until they are clicked.
++    const choice = await vscode.window.showErrorMessage(message, 'Open Chat', 'Dismiss');
 +    if (choice === 'Open Chat') await openChat(event.sessionId);
 +  }
 +
@@ -448,11 +447,11 @@ index 0000000..fc84ec1
 +  private async notifyWindows(event: ClaudeAttentionEvent, headline: string, chatTitle: string | undefined): Promise<void> {
 +    try {
 +      // asExternalUri() adds this window's id, so that VSCode hands the click to this window.
-+      const query = event.inExtension ? `chat=${encodeURIComponent(event.sessionId)}` : '';
++      const query = `chat=${encodeURIComponent(event.sessionId)}`;
 +      const uri = vscode.Uri.parse(`${vscode.env.uriScheme}://${this.extensionId}${OPEN_CHAT_PATH}`).with({ query });
 +      const launch = await vscode.env.asExternalUri(uri);
 +      const env: NodeJS.ProcessEnv = {
-+        HUNKWISE_TOAST_XML: toastXml(headline, event.detail, chatTitle, launch.toString(true), event.inExtension ? 'Open Chat' : 'Show VS Code'),
++        HUNKWISE_TOAST_XML: toastXml(headline, event.detail, chatTitle, launch.toString(true)),
 +        // A new toast for the same chat replaces the previous one.
 +        HUNKWISE_TOAST_TAG: event.sessionId.slice(0, 64),
 +        HUNKWISE_TOAST_APP: await this.windowsAppId(),
@@ -487,7 +486,7 @@ index 0000000..fc84ec1
 +}
 diff --git a/src/claudeCodeDrafts.ts b/src/claudeCodeDrafts.ts
 new file mode 100644
-index 0000000..d22ba83
+index 0000000..911b2b4
 --- /dev/null
 +++ b/src/claudeCodeDrafts.ts
 @@ -0,0 +1,159 @@
@@ -652,7 +651,7 @@ index 0000000..d22ba83
 +}
 diff --git a/src/claudeHooks.ts b/src/claudeHooks.ts
 new file mode 100644
-index 0000000..f87507b
+index 0000000..346f186
 --- /dev/null
 +++ b/src/claudeHooks.ts
 @@ -0,0 +1,403 @@
@@ -720,8 +719,8 @@ index 0000000..f87507b
 +}
 +
 +/**
-+ * A Claude Code chat that waits for the user: it asks a question, has a plan to approve, or asks
-+ * permission for a tool call. detail says what it waits for, in one line.
++ * A chat in the Claude Code extension that waits for the user: it asks a question, has a plan to
++ * approve, or asks permission for a tool call. detail says what it waits for, in one line.
 + */
 +export interface ClaudeAttentionEvent {
 +  kind: 'attention';
@@ -731,8 +730,6 @@ index 0000000..f87507b
 +  transcriptPath?: string;
 +  toolName: string;
 +  detail: string;
-+  /** Whether the chat runs in the Claude Code extension, as opposed to a terminal. */
-+  inExtension: boolean;
 +}
 +
 +export type ClaudeHookEvent = ClaudeToolEvent | ClaudeAttentionEvent;
@@ -903,6 +900,9 @@ index 0000000..f87507b
 +      ? WAITING_TOOLS.has(tool)
 +      : event === 'PermissionRequest' && !WAITING_TOOLS.has(tool) && !input.agent_id;
 +    if (!waits) return event === 'PermissionRequest';
++    // Chats elsewhere (a terminal, the Claude desktop app) use the same hooks, but the user does
++    // not wait for them in VSCode.
++    if (entrypoint !== EXTENSION_ENTRYPOINT) return true;
 +    this.writeEvent({
 +      kind: 'attention',
 +      id: typeof input.tool_use_id === 'string' ? input.tool_use_id : `${input.session_id}:${Date.now()}`,
@@ -911,7 +911,6 @@ index 0000000..f87507b
 +      transcriptPath: typeof input.transcript_path === 'string' ? input.transcript_path : undefined,
 +      toolName: tool,
 +      detail: attentionDetail(tool, input.tool_input),
-+      inExtension: entrypoint === EXTENSION_ENTRYPOINT,
 +    });
 +    return true;
 +  }
@@ -4420,7 +4419,7 @@ index 0000000..24ff5c2
 +});
 diff --git a/src/test/claudeAttention.test.ts b/src/test/claudeAttention.test.ts
 new file mode 100644
-index 0000000..b6143ac
+index 0000000..6562fce
 --- /dev/null
 +++ b/src/test/claudeAttention.test.ts
 @@ -0,0 +1,66 @@
@@ -4472,21 +4471,21 @@ index 0000000..b6143ac
 +
 +describe('toastXml', () => {
 +  it('escapes the text and the link', () => {
-+    const xml = toastXml('Claude has a question', 'Use <b> & "quotes"?', 'Chat & co', 'vscode://molon.hunkwise/open-chat?chat=1&windowId=2', 'Open Chat');
++    const xml = toastXml('Claude has a question', 'Use <b> & "quotes"?', 'Chat & co', 'vscode://molon.hunkwise/open-chat?chat=1&windowId=2');
 +    assert.ok(xml.includes('<text>Use &lt;b&gt; &amp; &quot;quotes&quot;?</text>'));
 +    assert.ok(xml.includes('<text placement="attribution">Chat &amp; co</text>'));
 +    assert.ok(xml.includes('launch="vscode://molon.hunkwise/open-chat?chat=1&amp;windowId=2"'));
 +  });
 +
 +  it('stays on screen until a button is clicked', () => {
-+    const xml = toastXml('Claude needs your permission', '', undefined, 'vscode://x/y', 'Show VS Code');
++    const xml = toastXml('Claude needs your permission', '', undefined, 'vscode://x/y');
 +    assert.ok(xml.startsWith('<toast scenario="reminder"'));
-+    assert.ok(xml.includes('<action content="Show VS Code" activationType="protocol" arguments="vscode://x/y"/>'));
++    assert.ok(xml.includes('<action content="Open Chat" activationType="protocol" arguments="vscode://x/y"/>'));
 +    assert.ok(xml.includes('<action content="Dismiss" activationType="system" arguments="dismiss"/>'));
 +  });
 +
 +  it('leaves out an empty body and a missing chat title', () => {
-+    const xml = toastXml('Claude needs your permission', '', undefined, 'vscode://x/y', 'Open Chat');
++    const xml = toastXml('Claude needs your permission', '', undefined, 'vscode://x/y');
 +    assert.equal(xml.match(/<text/g)?.length, 1);
 +  });
 +});
@@ -4722,10 +4721,10 @@ index 0000000..7153bde
 +});
 diff --git a/src/test/claudeHooks.test.ts b/src/test/claudeHooks.test.ts
 new file mode 100644
-index 0000000..33819db
+index 0000000..7951b23
 --- /dev/null
 +++ b/src/test/claudeHooks.test.ts
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,323 @@
 +import { describe, it, beforeEach, afterEach } from 'node:test';
 +import assert from 'node:assert/strict';
 +import * as fs from 'fs';
@@ -4905,15 +4904,17 @@ index 0000000..33819db
 +      transcriptPath: '/t.jsonl',
 +      toolName: 'AskUserQuestion',
 +      detail: 'Which color do you like?',
-+      inExtension: true,
 +    }]);
 +  });
 +
-+  it('knows a chat in a terminal is not in the extension', () => {
++  it('does not share chats outside the Claude Code extension, but still tracks their edits', () => {
 +    const server = newServer(0);
-+    server.process(hookInput('PreToolUse', 'ExitPlanMode', { plan: '# Plan' }), 'cli');
-+    server.process(hookInput('PreToolUse', 'ExitPlanMode', { plan: '# Plan' }));
-+    assert.deepEqual(attentionEvents().map(e => e.inExtension), [false, false]);
++    for (const entrypoint of ['cli', 'claude-desktop', undefined]) {
++      server.process(hookInput('PreToolUse', 'ExitPlanMode', { plan: '# Plan' }), entrypoint);
++      server.process(hookInput('PermissionRequest', 'Edit', { file_path: file }), entrypoint);
++      server.process(hookInput('PreToolUse', 'Edit', { file_path: file }), entrypoint);
++    }
++    assert.deepEqual(readEvents().map(e => e.kind), ['pre', 'pre', 'pre']);
 +  });
 +
 +  it('shares permission prompts of the main chat only', () => {
@@ -4927,23 +4928,23 @@ index 0000000..33819db
 +
 +  it('announces a question or plan once, through its PreToolUse', () => {
 +    const server = newServer(0);
-+    server.process(hookInput('PreToolUse', 'AskUserQuestion', question));
-+    server.process(hookInput('PermissionRequest', 'AskUserQuestion', question));
-+    server.process(hookInput('PostToolUse', 'AskUserQuestion', question));
++    server.process(hookInput('PreToolUse', 'AskUserQuestion', question), 'claude-vscode');
++    server.process(hookInput('PermissionRequest', 'AskUserQuestion', question), 'claude-vscode');
++    server.process(hookInput('PostToolUse', 'AskUserQuestion', question), 'claude-vscode');
 +    assert.equal(attentionEvents().length, 1);
 +  });
 +
 +  it('ignores tool calls that do not wait for the user', () => {
 +    const server = newServer(0);
-+    server.process(hookInput('PreToolUse', 'Bash', { command: 'ls' }));
-+    server.process(hookInput('PreToolUse', 'Edit', { file_path: file }));
++    server.process(hookInput('PreToolUse', 'Bash', { command: 'ls' }), 'claude-vscode');
++    server.process(hookInput('PreToolUse', 'Edit', { file_path: file }), 'claude-vscode');
 +    assert.equal(attentionEvents().length, 0);
 +  });
 +
 +  it('still tracks edits that needed permission', () => {
 +    const server = newServer(0);
-+    server.process(hookInput('PermissionRequest', 'Edit', { file_path: file }));
-+    server.process(hookInput('PreToolUse', 'Edit', { file_path: file }));
++    server.process(hookInput('PermissionRequest', 'Edit', { file_path: file }), 'claude-vscode');
++    server.process(hookInput('PreToolUse', 'Edit', { file_path: file }), 'claude-vscode');
 +    assert.deepEqual(readEvents().map(e => e.kind), ['attention', 'pre']);
 +  });
 +});
