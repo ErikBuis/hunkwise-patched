@@ -54,7 +54,7 @@ When a chat asks you a question, has a plan for you to approve, or asks permissi
 - On Windows, when VS Code isn't the app in front, its taskbar button also gets a red background (like a chat app with an unread message) until you switch to VS Code.
 - On Linux and macOS, which don't get these, a notification in the VS Code window of that chat instead, with an **Open Chat** button. It stays until you click **Open Chat** or **Dismiss** (VS Code only keeps error notifications open, so it has the red error icon).
 
-Chats that run in a terminal (the `claude` CLI) are announced too, but without a way to open them.
+Only chats in the Claude Code extension are announced. Chats in a terminal (the `claude` CLI) or in the Claude desktop app use the same hooks, so their edits still show up as hunks, but you answer their questions there, not in VS Code.
 
 ## Known limitations
 - Files Claude changes through Bash (`sed`, scripts, git) are not shown, including deleted files. Claude Code has no delete tool, and I couldn't find a way to attribute Bash changes to Claude without also catching things you did yourself at the same moment. I'd rather miss those than show false positives.
@@ -67,7 +67,7 @@ Chats that run in a terminal (the `claude` CLI) are announced too, but without a
 - The notifications only come from the VS Code window whose folder the chat runs in, and the Windows notification and taskbar highlight only exist on Windows (not on Linux, macOS or in a dev container).
 
 ## How it works (for nerds)
-To know what Claude edits, hunkwise runs a tiny local server on `127.0.0.1:47821` and Claude Code calls it right before and after every Edit/Write/NotebookEdit. Claude Code also calls it right before every AskUserQuestion (a question for you) and ExitPlanMode (a plan for you), and for every permission prompt, which is how hunkwise knows a chat waits for you. The install script registers these hooks in `~/.claude/settings.json`, and your other settings and hooks stay untouched. The hooks send the `CLAUDE_CODE_ENTRYPOINT` of the chat along, so hunkwise can tell a chat in VS Code from one in a terminal. If VS Code isn't running, the hooks just find nothing listening and Claude Code carries on normally.
+To know what Claude edits, hunkwise runs a tiny local server on `127.0.0.1:47821` and Claude Code calls it right before and after every Edit/Write/NotebookEdit. Claude Code also calls it right before every AskUserQuestion (a question for you) and ExitPlanMode (a plan for you), and for every permission prompt, which is how hunkwise knows a chat waits for you. The install script registers these hooks in `~/.claude/settings.json`, and your other settings and hooks stay untouched. The hooks send the `CLAUDE_CODE_ENTRYPOINT` of the chat along, so hunkwise can tell a chat in VS Code from one in a terminal or in the Claude desktop app. If VS Code isn't running, the hooks just find nothing listening and Claude Code carries on normally.
 
 The original hunkwise copies every file in your workspace into a private git repo when you turn it on, so it has something to compare against when any file changes. This build doesn't need that, since the hooks tell it what a file looked like right before Claude changed it. So it only stores the files that are under review, and drops each one again once you've accepted or discarded all its hunks. Turning it on in a big repo costs nothing, and a leftover copy from an older version is cleaned up the next time VS Code starts.
 
