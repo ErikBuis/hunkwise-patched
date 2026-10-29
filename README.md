@@ -44,7 +44,7 @@ Everything else, like your own typing, a Black formatting run, or a Git discard,
 
 ## Claude Code chats
 ### Unsent text stays with its chat
-Claude Code empties the message box whenever you switch to another chat (in the side bar or in a tab), so a half-written message is gone when you come back. With hunkwise, the text you typed stays with the chat you typed it in, and comes back when you switch back to that chat, also after VS Code reloads or restarts.
+Before version 2.1.312, Claude Code empties the message box whenever you switch to another chat (in the side bar or in a tab), so a half-written message is gone when you come back. Since 2.1.312 it keeps that text itself while VS Code runs, but it's still gone after VS Code reloads or restarts. With hunkwise, the text you typed stays with the chat you typed it in, and comes back when you switch back to that chat, also after VS Code reloads or restarts.
 
 VS Code doesn't let one extension reach into another extension's UI, so hunkwise patches Claude Code's chat UI (`webview/index.js` in Claude Code's extension folder) to do this. It patches every Claude Code version it finds, and also new versions as soon as Claude Code updates itself, before VS Code loads them. A chat panel that was already open before the patch only starts keeping your text after VS Code reloads. If an update changes Claude Code's code so much that hunkwise no longer recognizes the message box, hunkwise leaves that version alone: Claude Code then works as usual, just without keeping your text, and the hunkwise log (Output panel > Hunkwise) says so.
 
