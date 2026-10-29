@@ -486,10 +486,10 @@ index 0000000..6e39a13
 +}
 diff --git a/src/claudeCodeDrafts.ts b/src/claudeCodeDrafts.ts
 new file mode 100644
-index 0000000..911b2b4
+index 0000000..439ced6
 --- /dev/null
 +++ b/src/claudeCodeDrafts.ts
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,162 @@
 +import * as fs from 'fs';
 +import * as path from 'path';
 +import * as vscode from 'vscode';
@@ -499,7 +499,7 @@ index 0000000..911b2b4
 +// Folders of installed Claude Code versions, e.g. anthropic.claude-code-2.1.296-win32-x64.
 +const CLAUDE_CODE_DIR = /^anthropic\.claude-code-\d/;
 +// The patch is wrapped in these comments, so that a newer version of it can replace it.
-+const PATCH_VERSION = 4;
++const PATCH_VERSION = 5;
 +const PATCH_BEGIN = `/*hunkwise-drafts-begin:v${PATCH_VERSION}*/`;
 +const PATCH_END = '/*hunkwise-drafts-end*/';
 +const ANY_PATCH = /\/\*hunkwise-drafts-begin:v\d+\*\/[\s\S]*?\/\*hunkwise-drafts-end\*\//g;
@@ -539,7 +539,9 @@ index 0000000..911b2b4
 +  source = source.replace(ANY_PATCH, '');
 +
 +  // function({session:S,onSubmit:..,context:..,onListFiles:..,...},ref){h();let[TEXT,setText]=useState(""),...
-+  const component = /\(function\(\{session:([\w$]+),onSubmit:[\w$]+,context:[\w$]+,onListFiles:[^{}]*\},[\w$]+\)\{[\w$]+\(\);let\[([\w$]+),[\w$]+\]=([\w$]+)\(""\)/g;
++  // Since Claude Code 2.1.312, TEXT starts at S.composerDraft: Claude Code then keeps the draft of
++  // each chat itself while the panel is open, but not when the window reloads.
++  const component = /\(function\(\{session:([\w$]+),onSubmit:[\w$]+,context:[\w$]+,onListFiles:[^{}]*\},[\w$]+\)\{[\w$]+\(\);let\[([\w$]+),[\w$]+\]=([\w$]+)\((?:""|\1\.composerDraft)\)/g;
 +  const matches = [...source.matchAll(component)];
 +  if (matches.length !== 1) return { kind: 'unsupported', reason: `found ${matches.length} message boxes instead of 1` };
 +  const [match, session, text, useState] = matches[0];
@@ -567,17 +569,18 @@ index 0000000..911b2b4
 +
 +  // One more state and effect after the effect that empties the box. hwDraft.session is the chat
 +  // the box shows and hwDraft.id its session id (which a new chat only gets later). When the chat
-+  // changes, its draft goes in the box (and the text of the previous chat goes out); when only the
-+  // id arrives, a saved draft goes in an empty box; otherwise (also when the id arrives after the
-+  // user started typing) the text is saved as the chat's draft, on the session and in the webview
-+  // state (s.hunkwiseDrafts, by session id).
++  // changes, its draft goes in the box (and the text of the previous chat goes out), unless the box
++  // already has it (Claude Code puts its own draft back); when only the id arrives, a saved draft
++  // goes in an empty box; otherwise (also when the id arrives after the user started typing) the
++  // text is saved as the chat's draft, on the session and in the webview state (s.hunkwiseDrafts,
++  // by session id).
 +  // try/catch: whatever goes wrong here may never break Claude Code's chat.
 +  const S = session;
 +  const insertAt = start + clearBox.index + clearBox[0].length;
 +  const patch = `${PATCH_BEGIN},(hwDraft=>${useEffect}(()=>{try{`
 +    + `let k=${S}.sessionId?.value,api=globalThis.acquireVsCodeApi?.(),s=api?.getState()||{},m=s.hunkwiseDrafts||{};`
 +    + `if(hwDraft.session!==${S}||hwDraft.id!==k){let isNew=hwDraft.session!==${S};hwDraft.session=${S};hwDraft.id=k;`
-+    + `let d=${S}.hunkwiseDraft??(k?m[k]:void 0);if(isNew?d||${text}:d&&!${text}){${setInput}(d||"");return}if(isNew)return}`
++    + `let d=${S}.hunkwiseDraft??(k?m[k]:void 0);if(isNew?(d||"")!==${text}:d&&!${text}){${setInput}(d||"");return}if(isNew)return}`
 +    + `${S}.hunkwiseDraft=${text};if(api&&k&&(m[k]||"")!==${text}){m={...m};delete m[k];if(${text})m[k]=${text};`
 +    + `let ks=Object.keys(m);if(ks.length>${MAX_SAVED_DRAFTS})delete m[ks[0]];api.setState({...api.getState(),hunkwiseDrafts:m})}`
 +    + `}catch{}},[${text},${S},${S}.sessionId?.value]))(${useState}({})[0])${PATCH_END}`;
@@ -4491,10 +4494,10 @@ index 0000000..6562fce
 +});
 diff --git a/src/test/claudeCodeDrafts.test.ts b/src/test/claudeCodeDrafts.test.ts
 new file mode 100644
-index 0000000..7153bde
+index 0000000..d71d1c6
 --- /dev/null
 +++ b/src/test/claudeCodeDrafts.test.ts
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,288 @@
 +import { beforeEach, describe, it } from 'node:test';
 +import assert from 'node:assert/strict';
 +import { patchChatDrafts } from '../claudeCodeDrafts';
@@ -4508,6 +4511,14 @@ index 0000000..7153bde
 +  + 'I21(A,()=>({setInputText:(f1)=>{a2(f1),J.sentPastes=[]}}),[J,a2]),'
 +  + 'r(()=>{if(E1.current&&j==="")E1.current.textContent=""},[j]),r(()=>{if(w!==null)O(null)},[j,w]);'
 +  + 'return E1});';
++
++// The message box of Claude Code 2.1.312 and later, which keeps a draft per chat itself while the
++// panel is open: j starts at the chat's composerDraft, and a layout effect (L2) puts that in the box
++// and saves the box's text in it when the box goes away or shows another chat. T9() counts the
++// calls of a2() for the tests.
++const MESSAGE_BOX_COMPOSER_DRAFT = 'function L2($,J){y(()=>{let Z=J.current;if(Z===null)return;'
++  + 'if($.composerDraft!=="")Z.textContent=$.composerDraft;return()=>{$.composerDraft=Z.textContent??""}},[$,J])}'
++  + MESSAGE_BOX.replace('x("")', 'x(J.composerDraft)').replace(',E1=n(null);', ',E1=n(null);L2(J,E1);').replace('N(f1)}', 'N(f1),T9()}');
 +
 +declare const globalThis: { acquireVsCodeApi?: () => unknown };
 +
@@ -4530,13 +4541,17 @@ index 0000000..7153bde
 +/**
 + * Runs the message box in source with just enough of React: state, refs (attached to the box's
 + * element before effects run), effects that run in order after a render when their dependencies
-+ * change, and re-renders after a state change.
++ * change (layout effects first) and whose cleanups run before they run again or when the box goes
++ * away, and re-renders after a state change.
 + */
 +function runMessageBox(source: string) {
 +  let slots: any[] = [];
 +  let slot = 0;
-+  let effects: (() => void)[] = [];
++  let cleanups: ((() => void) | undefined)[] = [];
++  const layoutEffects: (() => void)[] = [];
++  const effects: (() => void)[] = [];
 +  let stateChanged = false;
++  let setInputCalls = 0;
 +  let props: { session: object } | undefined;
 +  let element = { textContent: '' };
 +  const useState = (initial: unknown) => {
@@ -4549,33 +4564,51 @@ index 0000000..7153bde
 +    if (!(i in slots)) slots[i] = { current: initial };
 +    return slots[i];
 +  };
-+  const useEffect = (effect: () => void, deps: unknown[]) => {
++  const effectHook = (queue: (() => void)[]) => (effect: () => unknown, deps: unknown[]) => {
 +    const i = slot++;
 +    const previous: unknown[] | undefined = slots[i];
 +    if (!previous || deps.some((dep, k) => dep !== previous[k])) {
 +      slots[i] = deps;
-+      effects.push(effect);
++      queue.push(() => {
++        cleanups[i]?.();
++        const cleanup = effect();
++        cleanups[i] = typeof cleanup === 'function' ? cleanup as () => void : undefined;
++      });
 +    }
 +  };
 +  // Like Claude Code, acquire the webview api once at startup.
-+  const Box = new Function('f0', 'X5', 'x', 'n', 'r', 'q0', 'I21', `${source}acquireVsCodeApi();return Box;`)(
-+    (component: unknown) => component, () => undefined, useState, useRef, useEffect, (fn: unknown) => fn, () => undefined,
++  const Box = new Function('f0', 'X5', 'x', 'n', 'r', 'q0', 'I21', 'y', 'T9', `${source}acquireVsCodeApi();return Box;`)(
++    (component: unknown) => component, () => undefined, useState, useRef, effectHook(effects), (fn: unknown) => fn, () => undefined,
++    effectHook(layoutEffects), () => { setInputCalls++; },
 +  );
 +  const render = () => {
 +    do {
 +      stateChanged = false;
 +      slot = 0;
-+      effects = [];
++      layoutEffects.length = 0;
++      effects.length = 0;
 +      const box = Box(props, null);
 +      box.current = element;
-+      effects.forEach(effect => effect());
++      [...layoutEffects, ...effects].forEach(effect => effect());
 +    } while (stateChanged);
++  };
++  // Every Claude Code session has a composerDraft, which starts empty (used since 2.1.312).
++  const show = (session: { composerDraft?: string }) => {
++    session.composerDraft ??= '';
++    props = { session };
 +  };
 +  return {
 +    /** Show session in a new message box, like Claude Code does when you switch chats. */
-+    mount(session: object) { slots = []; element = { textContent: '' }; props = { session }; render(); },
++    mount(session: object) {
++      cleanups.forEach(cleanup => cleanup?.());
++      cleanups = [];
++      slots = [];
++      element = { textContent: '' };
++      show(session);
++      render();
++    },
 +    /** Show session in the same message box. */
-+    rerender(session: object) { props = { session }; render(); },
++    rerender(session: object) { show(session); render(); },
 +    /** Type text at the end of the box, like the user does. */
 +    type(text: string) { element.textContent += text; slots[0] = element.textContent; render(); },
 +    /** Empty the box, like sending the message does. */
@@ -4584,14 +4617,17 @@ index 0000000..7153bde
 +    get shown(): string { return element.textContent; },
 +    /** The text Claude Code sends. */
 +    get text(): string { return slots[0]; },
++    /** How often the message box of MESSAGE_BOX_COMPOSER_DRAFT set its text through a2(). */
++    get setInputCalls(): number { return setInputCalls; },
 +  };
 +}
 +
-+describe('patchChatDrafts', () => {
++for (const [version, messageBox] of [['Claude Code before 2.1.312', MESSAGE_BOX], ['Claude Code 2.1.312 and later', MESSAGE_BOX_COMPOSER_DRAFT]]) {
++describe(`patchChatDrafts with ${version}`, () => {
 +  beforeEach(() => installWebviewApi({}));
 +
 +  it('keeps the text of each chat when switching between chats', () => {
-+    const box = runMessageBox(patched(MESSAGE_BOX));
++    const box = runMessageBox(patched(messageBox));
 +    const first = {};
 +    const second = {};
 +    box.mount(first);
@@ -4609,7 +4645,7 @@ index 0000000..7153bde
 +  });
 +
 +  it('does not bring back text that was sent', () => {
-+    const box = runMessageBox(patched(MESSAGE_BOX));
++    const box = runMessageBox(patched(messageBox));
 +    const chat = {};
 +    box.mount(chat);
 +    box.type('a question');
@@ -4620,7 +4656,7 @@ index 0000000..7153bde
 +  });
 +
 +  it('also switches drafts when the same message box shows another chat', () => {
-+    const box = runMessageBox(patched(MESSAGE_BOX));
++    const box = runMessageBox(patched(messageBox));
 +    const first = {};
 +    const second = {};
 +    box.mount(first);
@@ -4635,7 +4671,7 @@ index 0000000..7153bde
 +  it('keeps the drafts when the window reloads', () => {
 +    const saved: { state?: any } = {};
 +    installWebviewApi(saved);
-+    const source = patched(MESSAGE_BOX);
++    const source = patched(messageBox);
 +    let box = runMessageBox(source);
 +    box.mount({ sessionId: { value: 's1' } });
 +    box.type('half a question');
@@ -4655,7 +4691,7 @@ index 0000000..7153bde
 +  it('puts a saved draft back when the chat only gets its session id after showing', () => {
 +    const saved: { state?: any } = { state: { other: 1, hunkwiseDrafts: { s1: 'from before the reload' } } };
 +    installWebviewApi(saved);
-+    const box = runMessageBox(patched(MESSAGE_BOX));
++    const box = runMessageBox(patched(messageBox));
 +    const chat = { sessionId: { value: undefined as string | undefined } };
 +    box.mount(chat);
 +    assert.equal(box.shown, '');
@@ -4669,7 +4705,7 @@ index 0000000..7153bde
 +  it('keeps text typed before the chat got its session id when the window reloads', () => {
 +    const saved: { state?: any } = {};
 +    installWebviewApi(saved);
-+    const source = patched(MESSAGE_BOX);
++    const source = patched(messageBox);
 +    let box = runMessageBox(source);
 +    const chat = { sessionId: { value: undefined as string | undefined } };
 +    box.mount(chat);
@@ -4683,6 +4719,11 @@ index 0000000..7153bde
 +    box.mount({ sessionId: { value: 's1' } });
 +    assert.equal(box.shown, 'typed early', 'Saved as soon as the id arrives, not only after the next keystroke');
 +  });
++});
++}
++
++describe('patchChatDrafts', () => {
++  beforeEach(() => installWebviewApi({}));
 +
 +  it('is needed: without it the box starts empty', () => {
 +    const box = runMessageBox(MESSAGE_BOX);
@@ -4692,6 +4733,32 @@ index 0000000..7153bde
 +    box.mount({});
 +    box.mount(chat);
 +    assert.equal(box.shown, '');
++  });
++
++  it('is needed with Claude Code 2.1.312: it keeps drafts itself, but not when the window reloads', () => {
++    let box = runMessageBox(MESSAGE_BOX_COMPOSER_DRAFT);
++    const chat = { sessionId: { value: 's1' } };
++    box.mount(chat);
++    box.type('half a question');
++    box.mount({});
++    box.mount(chat);
++    assert.equal(box.shown, 'half a question');
++
++    installWebviewApi({});
++    box = runMessageBox(MESSAGE_BOX_COMPOSER_DRAFT);
++    box.mount({ sessionId: { value: 's1' } });
++    assert.equal(box.shown, '');
++  });
++
++  it('leaves putting the draft back to Claude Code 2.1.312 when it does that itself', () => {
++    const box = runMessageBox(patched(MESSAGE_BOX_COMPOSER_DRAFT));
++    const chat = {};
++    box.mount(chat);
++    box.type('half a question');
++    box.mount({});
++    box.mount(chat);
++    assert.equal(box.shown, 'half a question');
++    assert.equal(box.setInputCalls, 0, 'Setting the same text again would also move the cursor');
 +  });
 +
 +  it('leaves an already patched source alone', () => {
